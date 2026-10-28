@@ -702,6 +702,18 @@ pub(crate) fn split_paste(buf: &mut Vec<u8>, chunk: Vec<u8>) -> PasteSplit {
     }
 }
 
+/// Is `split_paste` holding only a possible start marker, not a paste body?
+/// A lone ESC is the common case: it is also the first byte of `\x1b[200~`.
+fn holds_paste_prefix(buf: &[u8]) -> bool {
+    !buf.is_empty() && find_seq(buf, PASTE_START).is_none()
+}
+
+/// Release a held partial start marker once its completion window is over.
+/// A paste that has begun is left alone: it waits for its end marker.
+pub(crate) fn flush_paste_prefix(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    holds_paste_prefix(buf).then(|| std::mem::take(buf))
+}
+
 fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
 }
@@ -811,7 +823,7 @@ struct App {
     paste_buf: Vec<u8>,
     /// partially-received SGR mouse sequence
     mouse_buf: Vec<u8>,
-    mouse_flush_at: Option<Instant>,
+    input_flush_at: Option<Instant>,
     /// input held back while an upload is in flight, flushed in order after
     paste_queue: Vec<Queued>,
     /// the payload that started the in-flight upload, so it can be forwarded
@@ -1175,13 +1187,27 @@ impl App {
             MouseSplit::Pending => {}
             MouseSplit::Passthrough(bytes) => self.route_input(bytes).await,
         }
-        self.mouse_flush_at = (!self.mouse_buf.is_empty())
-            .then(|| Instant::now() + MOUSE_INPUT_TIMEOUT);
     }
 
-    /// Flush an unfinished mouse prefix after its short completion window.
-    async fn flush_mouse_input(&mut self) {
-        self.mouse_flush_at = None;
+    /// Arm the completion window for whatever stdin bytes are being held: a
+    /// partial mouse sequence, or a partial paste start marker. Both holds
+    /// catch a lone ESC, and a held key must still go out on its own, not
+    /// glued to the next keystroke (`ESC` + `ESC O A` reads as Alt+Up).
+    fn arm_input_flush(&mut self) {
+        let held = !self.mouse_buf.is_empty() || holds_paste_prefix(&self.paste_buf);
+        self.input_flush_at = held.then(|| Instant::now() + MOUSE_INPUT_TIMEOUT);
+    }
+
+    /// Flush held input after its short completion window.
+    async fn flush_held_input(&mut self) {
+        self.input_flush_at = None;
+        if let Some(bytes) = flush_paste_prefix(&mut self.paste_buf) {
+            // its window has already run, so it does not wait out a second
+            // one in the mouse hold
+            if let MouseSplit::Passthrough(bytes) = split_mouse(&mut self.mouse_buf, bytes) {
+                self.route_input(bytes).await;
+            }
+        }
         if let Some(bytes) = flush_mouse(&mut self.mouse_buf) {
             self.route_input(bytes).await;
         }
@@ -1198,24 +1224,25 @@ impl App {
         let mut chunk = chunk;
         loop {
             match split_paste(&mut self.paste_buf, chunk) {
-                PasteSplit::Pending => return,
-                PasteSplit::Passthrough(bytes) => return self.route_mouse_input(bytes).await,
+                PasteSplit::Pending => break,
+                PasteSplit::Passthrough(bytes) => {
+                    self.route_mouse_input(bytes).await;
+                    break;
+                }
                 PasteSplit::Complete { before, body, after } => {
                     self.route_mouse_input(before).await;
                     // A partial mouse sequence cannot continue into a paste;
                     // discard it before delivering the paste body directly.
-                    if !self.mouse_buf.is_empty() {
-                        self.mouse_buf.clear();
-                        self.mouse_flush_at = None;
-                    }
+                    self.mouse_buf.clear();
                     self.route_paste_body(body).await;
                     if after.is_empty() {
-                        return;
+                        break;
                     }
                     chunk = after;
                 }
             }
         }
+        self.arm_input_flush();
     }
 
     /// Ordinary input, held back while an upload is in flight so the pasted
@@ -1640,7 +1667,7 @@ pub async fn run(args: Args) -> Result<()> {
         paste_inflight: false,
         paste_buf: Vec::new(),
         mouse_buf: Vec::new(),
-        mouse_flush_at: None,
+        input_flush_at: None,
         paste_queue: Vec::new(),
         paste_original: None,
     };
@@ -1688,7 +1715,7 @@ pub async fn run(args: Args) -> Result<()> {
             idle_at,
             app.predict.deadline(),
             app.settle_at,
-            app.mouse_flush_at,
+            app.input_flush_at,
         ]);
 
         tokio::select! {
@@ -1770,8 +1797,8 @@ pub async fn run(args: Args) -> Result<()> {
                     app.settle_at = None;
                     app.spawn_foreground_poll(true); // forced: bypass the throttle
                 }
-                if app.mouse_flush_at.is_some_and(|t| t <= now) {
-                    app.flush_mouse_input().await;
+                if app.input_flush_at.is_some_and(|t| t <= now) {
+                    app.flush_held_input().await;
                 }
                 if app.predict.deadline().is_some_and(|t| t <= now) {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
@@ -2331,9 +2358,9 @@ mod tests {
     }
 
 
-    // Exercise the real input routing: a release and the next press can share
-    // one stdin read. A local sink stands in for the session; no SSH is used.
-    async fn selection_followed_by_press(next_drag: bool) {
+    /// An App in control whose session is a local `cat`: what it is sent comes
+    /// out on the child's stdout when `stdout` is piped. No SSH is used.
+    fn control_app(stdout: Stdio) -> (App, tokio::process::Child) {
         let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
         let tty = true;
         let (tx, _rx) = mpsc::channel(256);
@@ -2368,12 +2395,12 @@ mod tests {
             paste_inflight: false,
             paste_buf: Vec::new(),
             mouse_buf: Vec::new(),
-            mouse_flush_at: None,
+            input_flush_at: None,
             paste_queue: Vec::new(),
             paste_original: None,
         };
         let mut child = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
+            .stdin(Stdio::piped()).stdout(stdout).kill_on_drop(true)
             .spawn().unwrap();
         app.session = Some(Session {
             gen: 1, mode: Mode::Control, process_group: child.id().unwrap() as i32,
@@ -2383,6 +2410,13 @@ mod tests {
         app.remote_fg = Some(Fg::Mouse);
         // Keep foreground polling local to this fixture: suppress SSH probes.
         app.fg_poll_at = Some(Instant::now());
+        (app, child)
+    }
+
+    // Exercise the real input routing: a release and the next press can share
+    // one stdin read.
+    async fn selection_followed_by_press(next_drag: bool) {
+        let (mut app, mut child) = control_app(Stdio::null());
         // Blank cells exercise copy handling without writing to the clipboard.
         app.grid.resize(80, 24);
         app.handle_stdin(
@@ -2409,6 +2443,49 @@ mod tests {
     #[tokio::test]
     async fn copying_selection_preserves_next_drag_in_same_read() {
         selection_followed_by_press(true).await;
+    }
+
+    #[test]
+    fn a_held_paste_prefix_flushes_but_a_started_paste_waits() {
+        let mut buf = Vec::new();
+        assert_eq!(split_paste(&mut buf, b"\x1b".to_vec()), PasteSplit::Pending);
+        assert_eq!(flush_paste_prefix(&mut buf), Some(b"\x1b".to_vec()));
+        assert!(buf.is_empty());
+
+        let mut buf = Vec::new();
+        assert_eq!(split_paste(&mut buf, b"\x1b[200~half".to_vec()), PasteSplit::Pending);
+        assert_eq!(flush_paste_prefix(&mut buf), None);
+        assert_eq!(buf, b"\x1b[200~half");
+    }
+
+    /// Esc, Esc, Up typed apart must reach the remote as three inputs. Each
+    /// lone ESC is held for a possible paste or mouse sequence; when that
+    /// window runs out (the loop's `input_flush_at` tick, called directly
+    /// here) it goes out alone instead of waiting to be glued to the next key.
+    #[tokio::test]
+    async fn a_lone_escape_goes_out_when_its_window_expires() {
+        let (mut app, child) = control_app(Stdio::piped());
+        for key in [&b"\x1b"[..], b"\x1b"] {
+            app.handle_stdin(key.to_vec()).await;
+            assert!(app.input_flush_at.is_some(), "a held ESC must arm the flush deadline");
+            app.flush_held_input().await;
+            assert!(app.input_flush_at.is_none());
+            assert!(app.paste_buf.is_empty() && app.mouse_buf.is_empty());
+        }
+        app.handle_stdin(b"\x1bOA".to_vec()).await;
+        assert!(app.input_flush_at.is_none());
+        drop(app); // closes cat's stdin
+        let out = child.wait_with_output().await.unwrap();
+        let sent: Vec<Vec<u8>> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                assert_eq!(v["type"], "terminal.input");
+                B64.decode(v["bytes"].as_str().unwrap()).unwrap()
+            })
+            .collect();
+        assert_eq!(sent, vec![b"\x1b".to_vec(), b"\x1b".to_vec(), b"\x1bOA".to_vec()]);
     }
 
 }
