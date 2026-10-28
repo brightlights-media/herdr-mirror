@@ -696,41 +696,58 @@ pub(crate) async fn spawn_streamer_pane(
         "exec {}\n",
         argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
     );
-    if let Err(e) = local
-        .request("pane.send_text", json!({ "pane_id": local_pane_id, "text": line }))
-        .await
-    {
-        crate::util::clear_streamer_spawn_pending(state_dir, local_pane_id);
-        log.log(&format!("spawn streamer {local_pane_id}: {e}"));
-        return;
-    }
 
     // Typed input can be eaten by interactive shell startup (oh-my-zsh's
     // update prompt swallows the first key — in EVERY new shell until it's
     // answered). Verify the streamer registered its pidfile and retype the
-    // exec if not, off-loop so a slow shell never stalls reconcile. The
-    // alive-check right before each resend keeps a late-starting streamer
-    // from getting the line typed into its stdin (which would forward it to
-    // the remote pane as text).
+    // exec if not, off-loop so a slow shell never stalls reconcile.
+    //
+    // Every line, the first included, is typed only while the pane's
+    // foreground is its placeholder shell: a streamer that already took over,
+    // or any other program, would forward the line to the remote pane as
+    // input. A retype can still queue up behind a shell that is slow to start
+    // but did take the first line; the streamer discards that when it starts.
     let (local, log, state_dir) = (local.clone(), log.clone(), state_dir.to_path_buf());
     let pane_id = local_pane_id.to_string();
     tokio::spawn(async move {
-        for wait_ms in [3000u64, 4000] {
+        let mut typed = false;
+        for wait_ms in [0u64, 3000, 4000] {
             tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-            if crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
-                || crate::util::pane_streamer_alive(&state_dir, &pane_id)
+            if typed
+                && (crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
+                    || crate::util::pane_streamer_alive(&state_dir, &pane_id))
             {
                 return;
             }
-            log.log(&format!(
-                "streamer for {pane_target} not up in {pane_id} — shell startup likely ate the exec; retyping"
-            ));
-            if local
+            match await_placeholder_shell(&local, &pane_id).await {
+                ShellGate::Ready => {}
+                // still starting up, or running something: try again next round
+                ShellGate::Busy => {
+                    log.log(&format!(
+                        "{pane_id} shell still busy; streamer launch for {pane_target} deferred"
+                    ));
+                    continue;
+                }
+                ShellGate::Closed => {
+                    crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
+                    log.log(&format!(
+                        "{pane_id} is not at its placeholder shell; not typing the streamer launch"
+                    ));
+                    return;
+                }
+            }
+            if typed {
+                log.log(&format!(
+                    "streamer for {pane_target} not up in {pane_id} — shell startup likely ate the exec; retyping"
+                ));
+            }
+            typed = true;
+            if let Err(e) = local
                 .request("pane.send_text", json!({ "pane_id": pane_id, "text": line }))
                 .await
-                .is_err()
             {
                 crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
+                log.log(&format!("spawn streamer {pane_id}: {e}"));
                 return; // pane gone (closed meanwhile) — nothing to heal
             }
         }
@@ -744,6 +761,70 @@ pub(crate) async fn spawn_streamer_pane(
             ));
         }
     });
+}
+
+/// Whether a streamer launch may be typed into a pane now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellGate {
+    /// the shell herdr started there is in the foreground: type
+    Ready,
+    /// that shell is running something in the foreground (a startup-file
+    /// command, a job): wait for it
+    Busy,
+    /// the shell's pid runs something else now (a streamer `exec`d over it),
+    /// or the pane can't be inspected: never type
+    Closed,
+}
+
+/// How long a launch waits out a busy shell. Kept well inside
+/// `SPAWN_PENDING_TTL` over all three attempts, so the launch claim cannot
+/// lapse while this task still means to type.
+const BUSY_SHELL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Poll the pane until its placeholder shell is in the foreground. Busy past
+/// `BUSY_SHELL_WAIT` answers `Busy`; the caller tries again on its next round.
+async fn await_placeholder_shell(local: &ApiClient, pane_id: &str) -> ShellGate {
+    let deadline = tokio::time::Instant::now() + BUSY_SHELL_WAIT;
+    loop {
+        let gate = match local.request("pane.process_info", json!({ "pane_id": pane_id })).await {
+            Ok(v) => shell_gate(&v),
+            Err(_) => ShellGate::Closed,
+        };
+        if gate != ShellGate::Busy || tokio::time::Instant::now() >= deadline {
+            return gate;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Classify a `pane.process_info` result. Typed text goes to the foreground
+/// process group, so the line is safe only when that group is the shell's
+/// own and the shell's pid still runs a shell. `exec` keeps the pid, so a
+/// streamer that took over shows up as that pid under a new name; herdr
+/// reports that within one ~50 ms poll.
+fn shell_gate(result: &Value) -> ShellGate {
+    #[derive(Deserialize)]
+    struct Proc {
+        pid: i64,
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Info {
+        shell_pid: i64,
+        foreground_process_group_id: i64,
+        foreground_processes: Vec<Proc>,
+    }
+    let Some(info) = result
+        .get("process_info")
+        .and_then(|v| serde_json::from_value::<Info>(v.clone()).ok())
+    else {
+        return ShellGate::Closed;
+    };
+    match info.foreground_processes.iter().find(|p| p.pid == info.shell_pid) {
+        Some(p) if !crate::foreground::is_shell(&p.name) => ShellGate::Closed,
+        Some(_) if info.foreground_process_group_id == info.shell_pid => ShellGate::Ready,
+        _ => ShellGate::Busy,
+    }
 }
 
 /// cwd every mirror pane runs in, doubling as the loop-guard marker: it's set at
@@ -1830,6 +1911,38 @@ mod tests {
         panes.insert("p1".into(), tombstoned("l1"));
         panes.insert("p3".into(), tombstoned("l3"));
         assert!(prune_closed(&tree, &panes).is_none());
+    }
+
+    /// `pane.process_info` result as herdr returns it (shapes captured live).
+    fn process_info(shell_pid: i64, fg_pgid: i64, procs: &[(i64, &str)]) -> Value {
+        json!({ "type": "pane_process_info", "process_info": {
+            "pane_id": "w1:p2",
+            "shell_pid": shell_pid,
+            "foreground_process_group_id": fg_pgid,
+            "foreground_processes": procs.iter().map(|(pid, name)| json!({
+                "pid": pid, "name": name, "argv0": name, "argv": [name], "cmdline": name, "cwd": "/",
+            })).collect::<Vec<_>>(),
+        }})
+    }
+
+    /// The launch is typed only into the shell herdr started in the pane. A
+    /// streamer that took over (same pid after `exec`) or a job the user runs
+    /// would receive the typed line and forward it to the remote pane.
+    #[test]
+    fn launch_is_typed_only_at_the_placeholder_shell() {
+        use ShellGate::*;
+        // idle at the prompt
+        assert_eq!(shell_gate(&process_info(100, 100, &[(100, "zsh")])), Ready);
+        assert_eq!(shell_gate(&process_info(100, 100, &[(100, "-zsh")])), Ready);
+        // a `$(...)` in a startup file runs in the shell's own group
+        assert_eq!(shell_gate(&process_info(100, 100, &[(105, "bash"), (100, "zsh")])), Ready);
+        // a startup-file command or a job in a group of its own: wait
+        assert_eq!(shell_gate(&process_info(100, 105, &[(105, "sleep")])), Busy);
+        assert_eq!(shell_gate(&process_info(100, 200, &[(200, "vim")])), Busy);
+        // the streamer exec'd over the shell: same pid, new name
+        assert_eq!(shell_gate(&process_info(100, 100, &[(100, "herdr-mirror")])), Closed);
+        // unparseable answers never type
+        assert_eq!(shell_gate(&json!({ "type": "pane_process_info" })), Closed);
     }
 
     /// Characterization test: the ssh pane argv is a cross-process contract.
