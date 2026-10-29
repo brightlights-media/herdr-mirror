@@ -488,7 +488,17 @@ fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> 
     None
 }
 
-const MOUSE_INPUT_TIMEOUT: Duration = Duration::from_millis(150);
+/// How long a partial mouse report or paste start marker is held for the rest
+/// of it, and so how long a lone ESC waits before it goes out alone.
+///
+/// The terminal writes each mouse report and each paste marker in one burst,
+/// and this reads the local pty, so a sequence split across two reads has its
+/// rest already queued: the second read lands within a few ms even on a busy
+/// machine (a stalled reader finds both halves in one read). Anything longer
+/// only delays every Esc keypress, which is Claude Code's interrupt and vim's
+/// mode switch. One window serves both holds: their bytes come from the same
+/// writer the same way.
+const HELD_INPUT_WINDOW: Duration = Duration::from_millis(20);
 const MAX_INCOMPLETE_MOUSE_BYTES: usize = 32;
 
 #[derive(Debug, PartialEq)]
@@ -1195,7 +1205,7 @@ impl App {
     /// glued to the next keystroke (`ESC` + `ESC O A` reads as Alt+Up).
     fn arm_input_flush(&mut self) {
         let held = !self.mouse_buf.is_empty() || holds_paste_prefix(&self.paste_buf);
-        self.input_flush_at = held.then(|| Instant::now() + MOUSE_INPUT_TIMEOUT);
+        self.input_flush_at = held.then(|| Instant::now() + HELD_INPUT_WINDOW);
     }
 
     /// Flush held input after its short completion window.
@@ -2506,7 +2516,12 @@ mod tests {
         let (mut app, child) = control_app(Stdio::piped());
         for key in [&b"\x1b"[..], b"\x1b"] {
             app.handle_stdin(key.to_vec()).await;
-            assert!(app.input_flush_at.is_some(), "a held ESC must arm the flush deadline");
+            let deadline = app.input_flush_at.expect("a held ESC must arm the flush deadline");
+            assert!(deadline <= Instant::now() + HELD_INPUT_WINDOW);
+            assert!(
+                HELD_INPUT_WINDOW <= Duration::from_millis(20),
+                "a lone ESC waits at most the short window, not a human-noticeable one"
+            );
             app.flush_held_input().await;
             assert!(app.input_flush_at.is_none());
             assert!(app.paste_buf.is_empty() && app.mouse_buf.is_empty());
@@ -2525,6 +2540,43 @@ mod tests {
             })
             .collect();
         assert_eq!(sent, vec![b"\x1b".to_vec(), b"\x1b".to_vec(), b"\x1bOA".to_vec()]);
+    }
+
+    /// A mouse report or paste start marker split across two reads, its rest
+    /// arriving inside the window, is reassembled: no fragment goes out on
+    /// its own.
+    #[tokio::test]
+    async fn a_sequence_split_inside_the_window_is_reassembled() {
+        let (mut app, child) = control_app(Stdio::piped());
+        // wheel-up report, split after its ESC [
+        // (the loop's flush tick is not run here: the window has not expired)
+        app.handle_stdin(b"\x1b[".to_vec()).await;
+        assert!(app.input_flush_at.is_some(), "a partial mouse report is held");
+        app.handle_stdin(b"<64;3;2M".to_vec()).await;
+        assert!(app.input_flush_at.is_none() && app.mouse_buf.is_empty());
+
+        // a paste start marker split mid-way stays held for its body
+        app.handle_stdin(b"\x1b[20".to_vec()).await;
+        assert!(app.input_flush_at.is_some());
+        app.handle_stdin(b"0~".to_vec()).await;
+        assert!(app.input_flush_at.is_none(), "a started paste waits for its end, not the window");
+        assert_eq!(app.paste_buf, b"\x1b[200~");
+        app.paste_buf.clear();
+
+        drop(app); // closes cat's stdin
+        let out = child.wait_with_output().await.unwrap();
+        let sent: Vec<Vec<u8>> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                B64.decode(v["bytes"].as_str()?).ok()
+            })
+            .collect();
+        assert!(
+            !sent.iter().any(|b| b == b"\x1b" || b == b"\x1b[" || b == b"\x1b[20"),
+            "a fragment went out on its own: {sent:?}"
+        );
     }
 
 }
