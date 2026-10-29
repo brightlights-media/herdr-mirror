@@ -3,9 +3,9 @@
 > **Brightlights fork.** This is [brightlights-media/herdr-mirror](https://github.com/brightlights-media/herdr-mirror),
 > a fork of [nikok6/herdr-mirror](https://github.com/nikok6/herdr-mirror) that carries fixes not yet
 > upstream. The `brightlights` branch is upstream `main` with each fix merged in, and its releases are
-> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.4` and so on), so `herdr plugin list` tells it
+> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.5` and so on), so `herdr plugin list` tells it
 > apart from upstream. Install it with
-> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.4`.
+> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.5`.
 > Each fix lives on its own branch, one commit off upstream `main` (`fix/short-escape-window` sits
 > on `fix/lone-escape-held-until-next-key`, and `fix/placeholder-gate-transient-process-info` on
 > `fix/streamer-launch-never-types-into-live-pane`), ready to offer upstream:
@@ -32,6 +32,10 @@
 > - [`perf/placeholder-plain-sh`](https://github.com/brightlights-media/herdr-mirror/tree/perf/placeholder-plain-sh):
 >   a mirror's placeholder pane starts a plain `sh` (`SHELL=/bin/sh` in its env) instead of the user's
 >   shell, so the streamer launches without waiting out the user's rc.
+> - [`feat/focus-new-mirror-of-a-local-request`](https://github.com/brightlights-media/herdr-mirror/tree/feat/focus-new-mirror-of-a-local-request):
+>   a pane or tab made by `remote-split` / `remote-tab` (or the native-key intercept) is focused
+>   as soon as its mirror is mapped, as a native split would be. Splits made inside the sandbox
+>   by anything else never take focus.
 
 A [herdr](https://herdr.dev) plugin that mirrors a remote herdr server's
 workspaces and agents into your local sidebar. One window shows the agents on
