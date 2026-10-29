@@ -168,7 +168,7 @@ pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {
 /// dropped from hosts.toml (by hand, or by a tool that writes it) gets no task:
 /// its mirrors stay up, frozen, and nothing is ever logged for it again. This
 /// names them so the cause is in the log rather than inferred from silence.
-/// Returns `(host, live mirror workspaces)`, sorted by host.
+/// Returns `(host, live mirror workspaces)`, sorted by host; hidden hosts are left out.
 pub fn unconfigured_hosts(state_dir: &Path, configured: &[&str]) -> Vec<(String, usize)> {
     let Ok(dir) = std::fs::read_dir(state_dir) else {
         return Vec::new();
@@ -176,7 +176,8 @@ pub fn unconfigured_hosts(state_dir: &Path, configured: &[&str]) -> Vec<(String,
     let mut out: Vec<(String, usize)> = dir
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter_map(|n| n.strip_suffix("-map.json").map(str::to_string))
-        .filter(|h| !configured.contains(&h.as_str()))
+        // a hidden host's mirrors were taken down, so none are on screen
+        .filter(|h| !configured.contains(&h.as_str()) && !is_hidden(state_dir, h))
         .map(|h| {
             let live = load_state(state_dir, &h).workspaces.values().filter(|w| !w.is_tombstoned()).count();
             (h, live)
@@ -309,6 +310,9 @@ mod tests {
             .unwrap();
         // nothing left on screen: dropping it is not worth a line on every start
         save_state(&dir, "all-closed", &with(vec![("w1", ws(Some(true)))])).unwrap();
+        // hidden: its mirrors were taken down, whatever the map says
+        save_state(&dir, "hidden", &with(vec![("w1", ws(None))])).unwrap();
+        set_hidden(&dir, "hidden", true).unwrap();
         std::fs::write(dir.join("dropped.ctl"), "").unwrap();
 
         assert_eq!(unconfigured_hosts(&dir, &["kept"]), vec![("dropped".to_string(), 2)]);
