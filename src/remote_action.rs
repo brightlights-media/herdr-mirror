@@ -368,6 +368,7 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
             let res: Value = api
                 .request("tab.create", json!({ "workspace_id": ws, "cwd": cwd, "focus": false }))
                 .await?;
+            focus_when_mirrored(env, &host, &ctx, res.pointer("/root_pane/pane_id"));
             println!(
                 "created tab {} in {}: {ws}; mirror follows shortly",
                 res.pointer("/tab/tab_id").and_then(|v| v.as_str()).unwrap_or("?"),
@@ -385,6 +386,7 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
                     json!({ "target_pane_id": pane_id, "direction": dir, "cwd": cwd, "focus": false }),
                 )
                 .await?;
+            focus_when_mirrored(env, &host, &ctx, res.pointer("/pane/pane_id"));
             println!(
                 "split {pane_id} {dir} on {} → {}; mirror follows shortly",
                 host.name,
@@ -394,6 +396,26 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
         _ => return Err(err(format!("unknown remote action: {kind}"))),
     }
     Ok(())
+}
+
+/// Ask the daemon to focus the new remote pane's mirror as soon as it maps it,
+/// as a native split or new tab focuses its pane, then poke it to converge now
+/// rather than after the remote's event and its debounce. Best effort: without
+/// a daemon the request just expires.
+fn focus_when_mirrored(env: &Env, host: &HostConfig, ctx: &InvocationContext, pane: Option<&Value>) {
+    let (Some(remote_pane_id), Some(local_ws)) = (pane.and_then(Value::as_str), &ctx.workspace_id) else {
+        return;
+    };
+    let req = crate::state::FocusRequest {
+        remote_pane_id: remote_pane_id.to_string(),
+        local_workspace_id: local_ws.clone(),
+        at_ms: crate::state::now_ms(),
+    };
+    if crate::state::request_focus(&env.state_dir, &host.name, &req).is_ok() {
+        if let Some(pid) = crate::daemon::running_pid(env) {
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+        }
+    }
 }
 
 /// Host for `hide`/`show`: an explicit name is looked up directly (same

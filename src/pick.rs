@@ -414,13 +414,12 @@ async fn intercept_in_mirror(
         // native new tab: the junk pane's tab is NOT a mirror tab
         "tab" if !mapped_tabs.contains(&junk_tab) => {
             let Some(anchor) = sibling_in(false) else { return Ok(()) };
-            let before = tab_ids_in(api, ws_id).await;
             mark();
             notice(env, &mirrors, "tab", &host.name);
             api.request("tab.close", json!({ "tab_id": junk_tab })).await?;
-            run_remote(env, ws_id, &anchor, "tab", None).await?;
-            focus_new_tab(api, ws_id, &before).await;
-            Ok(())
+            // remote_action leaves a focus request; the daemon focuses the
+            // tab's mirror as soon as it maps it
+            run_remote(env, ws_id, &anchor, "tab", None).await
         }
         // native split: the junk pane sits INSIDE a mirror tab
         "pane" if mapped_tabs.contains(&junk_tab) => {
@@ -495,37 +494,6 @@ async fn run_remote(
         local_socket: env.local_socket.clone(),
     };
     crate::remote_action::run_cmd(env2, kind, direction).await
-}
-
-async fn tab_ids_in(api: &ApiClient, ws_id: &str) -> std::collections::HashSet<String> {
-    let Ok(t) = api.request("tab.list", json!({})).await else { return Default::default() };
-    t.get("tabs")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter(|t| t.get("workspace_id").and_then(Value::as_str) == Some(ws_id))
-                .filter_map(|t| t.get("tab_id").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The user pressed "new tab" and expects to land in it; the daemon mirrors
-/// the remote tab back unfocused, so follow it. Best-effort with a ceiling.
-async fn focus_new_tab(
-    api: &ApiClient,
-    ws_id: &str,
-    before: &std::collections::HashSet<String>,
-) {
-    for _ in 0..16 {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let now = tab_ids_in(api, ws_id).await;
-        if let Some(fresh) = now.iter().find(|id| !before.contains(*id)) {
-            let _ = api.request("tab.focus", json!({ "tab_id": fresh })).await;
-            return;
-        }
-    }
 }
 
 /// The invoking pane's cwd, from the shell-binding env var or the
