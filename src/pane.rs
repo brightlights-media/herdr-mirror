@@ -234,20 +234,63 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
+/// ssh argv for a pane stream, through `master` when it is given.
+///
+/// A pane stream must never pick up a ControlPath from ~/.ssh/config: a stale
+/// shared master can hang the stream before the remote command starts. So it
+/// either goes through the daemon's own master for this host, which the caller
+/// has just seen answer (`master_answers`), or through none at all (`-S none`),
+/// paying a full handshake. `ControlMaster=no` keeps a stream from ever
+/// becoming a master itself.
+///
+/// Going through the master skips the handshake, the bulk of a new mirror
+/// pane's time to first frame. When sshd refuses the extra session (its
+/// `MaxSessions`, 10 by default, counts per connection), ssh says
+/// "Session open refused by peer" and connects directly on its own, so a host
+/// with more panes than the limit still streams every one.
+fn ssh_stream_args(ssh_target: &str, cmd: &str, master: Option<&str>) -> Vec<String> {
     let mut argv: Vec<String> = crate::remote::SSH_COMMON_OPTS
         .iter()
         .map(|arg| (*arg).to_string())
         .collect();
-    // A pane stream is long-lived and interactive. It must not inherit a
-    // ControlPath from ~/.ssh/config: a stale shared master can hang
-    // the stream before the remote command starts. `-S none` disables control
-    // socket use without changing the daemon's intentional multiplexing.
-    argv.extend(["-S".into(), "none".into(), ssh_target.into(), cmd.into()]);
+    match master {
+        Some(ctl) => argv.extend(["-S".into(), ctl.into(), "-o".into(), "ControlMaster=no".into()]),
+        None => argv.extend(["-S".into(), "none".into()]),
+    }
+    argv.extend([ssh_target.into(), cmd.into()]);
     argv
 }
 
-fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
+/// How long `master_answers` waits. The check is a local socket round trip
+/// (a few ms); a master that takes longer is not one to stream through.
+const MASTER_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Does the daemon's master for this host answer `ssh -O check` in time?
+async fn master_answers(ctl: &str, ssh_target: &str) -> bool {
+    if !std::path::Path::new(ctl).exists() {
+        return false;
+    }
+    let mut c = tokio::process::Command::new("ssh");
+    c.args(["-o", "BatchMode=yes", "-S", ctl, "-O", "check", ssh_target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    matches!(
+        tokio::time::timeout(MASTER_CHECK_TIMEOUT, c.status()).await,
+        Ok(Ok(status)) if status.success()
+    )
+}
+
+fn spawn_session(
+    args: &Args,
+    master: Option<&str>,
+    mode: Mode,
+    cols: usize,
+    rows: usize,
+    gen: u64,
+    tx: mpsc::Sender<Msg>,
+) -> Result<Session> {
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
     // config::remote_herdr_expr).
@@ -268,7 +311,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     let mut builder = match &args.container {
         None => {
             let mut c = tokio::process::Command::new("ssh");
-            c.args(ssh_stream_args(&args.ssh_target, &cmd));
+            c.args(ssh_stream_args(&args.ssh_target, &cmd, master));
             c
         }
         Some(ct) => {
@@ -1033,7 +1076,11 @@ impl App {
             kill_session_process_group(s.process_group);
         }
         self.next_gen += 1;
-        match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
+        let master = match (&self.args.ctl_path, &self.args.container) {
+            (Some(ctl), None) if master_answers(ctl, &self.args.ssh_target).await => Some(ctl.clone()),
+            _ => None,
+        };
+        match spawn_session(&self.args, master.as_deref(), m, cols, rows, self.next_gen, self.tx.clone()) {
             Ok(mut s) => {
                 if m == Mode::Control {
                     self.last_input = Instant::now();
@@ -1925,7 +1972,7 @@ mod tests {
 
     #[test]
     fn pane_ssh_stream_disables_configured_control_sockets() {
-        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM");
+        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM", None);
 
         assert_eq!(
             &argv[crate::remote::SSH_COMMON_OPTS.len()..],
@@ -1936,6 +1983,42 @@ mod tests {
                 "exec herdr terminal session observe w5:pM",
             ]
         );
+    }
+
+    /// With the daemon's master answering, a stream rides it (no handshake)
+    /// and can never become a master itself.
+    #[test]
+    fn pane_ssh_stream_rides_the_daemons_master() {
+        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM", Some("/state/work.ctl"));
+
+        assert_eq!(
+            &argv[crate::remote::SSH_COMMON_OPTS.len()..],
+            [
+                "-S",
+                "/state/work.ctl",
+                "-o",
+                "ControlMaster=no",
+                "work",
+                "exec herdr terminal session observe w5:pM",
+            ]
+        );
+    }
+
+    /// A missing or dead master is not streamed through: the stream falls back
+    /// to its own connection rather than hanging on a stale socket.
+    #[tokio::test]
+    async fn a_dead_master_is_not_used() {
+        let dir = std::env::temp_dir().join(format!("hm-master-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let missing = dir.join("missing.ctl");
+        assert!(!master_answers(missing.to_str().unwrap(), "work").await);
+        // a plain file where the socket should be: the check fails, and fast
+        let stale = dir.join("stale.ctl");
+        std::fs::write(&stale, "").unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(!master_answers(stale.to_str().unwrap(), "work").await);
+        assert!(t0.elapsed() <= MASTER_CHECK_TIMEOUT + Duration::from_millis(500));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Uncapped must stay byte-identical to the old `term_size()` call, or
