@@ -1,5 +1,24 @@
 # herdr-mirror
 
+> **Brightlights fork.** This is [brightlights-media/herdr-mirror](https://github.com/brightlights-media/herdr-mirror),
+> a fork of [nikok6/herdr-mirror](https://github.com/nikok6/herdr-mirror) that carries fixes not yet
+> upstream. The `brightlights` branch is upstream `main` with each fix merged in, and its releases are
+> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.1` and so on), so `herdr plugin list` tells it
+> apart from upstream. Install it with
+> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.1`.
+> Each fix lives on its own branch, one commit off upstream `main`, ready to offer upstream:
+>
+> - [`fix/streamer-launch-never-types-into-live-pane`](https://github.com/brightlights-media/herdr-mirror/tree/fix/streamer-launch-never-types-into-live-pane):
+>   the streamer-launch retry no longer types `exec …` into a pane running another program; it checks
+>   the pane's foreground process first, and the streamer flushes stray input when it starts.
+> - [`fix/close-mirror-on-remote-pane-exit`](https://github.com/brightlights-media/herdr-mirror/tree/fix/close-mirror-on-remote-pane-exit):
+>   a remote pane that exits (`pane_exited`) closes its mirror at once instead of on the next poll.
+> - [`fix/lone-escape-held-until-next-key`](https://github.com/brightlights-media/herdr-mirror/tree/fix/lone-escape-held-until-next-key):
+>   a lone Esc is sent after 150 ms instead of being held until the next key.
+> - [`fix/log-unsynced-mirrors-of-dropped-hosts`](https://github.com/brightlights-media/herdr-mirror/tree/fix/log-unsynced-mirrors-of-dropped-hosts):
+>   at start, the daemon names any host removed from `hosts.toml` whose mirrors are still on screen,
+>   instead of going silent on it.
+
 A [herdr](https://herdr.dev) plugin that mirrors a remote herdr server's
 workspaces and agents into your local sidebar. One window shows the agents on
 every machine — blocked, working, done — with live pane content you can watch
