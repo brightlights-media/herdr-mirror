@@ -1527,6 +1527,13 @@ impl Drop for PidfileGuard {
     }
 }
 
+/// Drop input the terminal has received but nobody has read yet.
+fn discard_typeahead(fd: libc::c_int) {
+    unsafe {
+        libc::tcflush(fd, libc::TCIFLUSH);
+    }
+}
+
 pub async fn run(args: Args) -> Result<()> {
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
     let local_pane_id = tty.then(|| std::env::var("HERDR_PANE_ID").ok()).flatten();
@@ -1568,6 +1575,13 @@ pub async fn run(args: Args) -> Result<()> {
         let _ = crate::state::take_pane_hint(&state_dir, id);
         PidfileGuard(path)
     });
+    // Anything already queued on our stdin was typed for the shell we replaced:
+    // a launch line retyped while that shell was still starting up. Read now,
+    // it would be forwarded to the remote pane as input. The pid is published
+    // above first, so no further launch line is typed after this.
+    if tty {
+        discard_typeahead(libc::STDIN_FILENO);
+    }
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
         // clicks reach us instead of scrolling the hosting pane's scrollback
@@ -1999,6 +2013,31 @@ mod tests {
         assert!(!contains_wheel_press(b"\x1b[<64;10;5m")); // release, not press
         assert!(has_mouse_seq(b"xx\x1b[<0;1;1Myy"));
         assert!(!has_mouse_seq(b"plain text"));
+    }
+
+    /// A launch line typed while the shell was still starting sits in the
+    /// terminal's input queue and would be the streamer's first stdin read.
+    /// Startup must drop it, and only it.
+    #[test]
+    fn startup_discards_input_typed_for_the_replaced_shell() {
+        let (mut master, mut slave) = (0, 0);
+        let rc = unsafe {
+            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, 0);
+        let write = |s: &[u8]| unsafe { libc::write(master, s.as_ptr().cast(), s.len()) };
+        write(b"exec herdr-mirror pane host w1:p1\n");
+        std::thread::sleep(Duration::from_millis(50));
+        discard_typeahead(slave);
+        write(b"typed later\n");
+        std::thread::sleep(Duration::from_millis(50));
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::read(slave, buf.as_mut_ptr().cast(), buf.len()) };
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        assert_eq!(&buf[..n as usize], b"typed later\n");
     }
 
     #[test]
