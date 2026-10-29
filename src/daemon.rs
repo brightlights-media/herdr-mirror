@@ -182,6 +182,21 @@ const BROADCAST_SUBS: &[&str] = &[
     "layout.updated",
 ];
 
+/// The id field of a remote event that means "this object is gone".
+///
+/// `pane_exited` counts: when a pane's process exits, herdr removes the pane
+/// and emits `pane_exited` (plus `layout_updated`), never `pane_closed`, and
+/// no `tab_closed` when it was a tab's last pane. Without it a shell's `exit`
+/// left the mirror standing until a later converge saw the pane absent twice.
+fn remote_close_key(event: &str) -> Option<&'static str> {
+    match event {
+        "workspace_closed" => Some("workspace_id"),
+        "tab_closed" => Some("tab_id"),
+        "pane_closed" | "pane_exited" => Some("pane_id"),
+        _ => None,
+    }
+}
+
 fn sub_list(pane_ids: &[String]) -> Vec<Value> {
     let mut subs: Vec<Value> = BROADCAST_SUBS.iter().map(|t| json!({ "type": t })).collect();
     subs.extend(pane_ids.iter().map(|p| json!({ "type": "pane.agent_status_changed", "pane_id": p })));
@@ -334,20 +349,17 @@ async fn run_connected(
                     }
                     // explicit remote closes are authoritative: remove the mirror
                     // directly instead of inferring it from snapshot absence
-                    Some(e) if matches!(e.event.as_str(), "workspace_closed" | "tab_closed" | "pane_closed") => {
-                        let key = match e.event.as_str() {
-                            "workspace_closed" => "workspace_id",
-                            "tab_closed" => "tab_id",
-                            _ => "pane_id",
-                        };
-                        if let Some(rid) = e.data.get(key).and_then(|v| v.as_str()) {
-                            pending_closes.push(rid.to_string());
-                            closes_at.get_or_insert(Instant::now() + Duration::from_millis(150));
+                    Some(e) => match remote_close_key(&e.event) {
+                        Some(key) => {
+                            if let Some(rid) = e.data.get(key).and_then(|v| v.as_str()) {
+                                pending_closes.push(rid.to_string());
+                                closes_at.get_or_insert(Instant::now() + Duration::from_millis(150));
+                            }
                         }
-                    }
-                    Some(_) => {
-                        converge_at.get_or_insert(Instant::now() + Duration::from_millis(500));
-                    }
+                        None => {
+                            converge_at.get_or_insert(Instant::now() + Duration::from_millis(500));
+                        }
+                    },
                 }
             }
             Some(()) = poke.recv() => {
@@ -1018,6 +1030,19 @@ mod tests {
     /// Detection is a separate lifecycle event from later status changes. If
     /// this broadcast subscription disappears, a newly detected agent can sit
     /// stale until the periodic poll even though its pane is already mirrored.
+    /// A remote shell's `exit` closes its pane with `pane_exited` alone. It
+    /// must take the immediate close path, and must stay subscribed.
+    #[test]
+    fn a_remote_pane_exit_closes_its_mirror_directly() {
+        assert_eq!(remote_close_key("pane_exited"), Some("pane_id"));
+        assert_eq!(remote_close_key("pane_closed"), Some("pane_id"));
+        assert_eq!(remote_close_key("tab_closed"), Some("tab_id"));
+        assert_eq!(remote_close_key("workspace_closed"), Some("workspace_id"));
+        assert_eq!(remote_close_key("pane_created"), None);
+        assert_eq!(remote_close_key("layout_updated"), None);
+        assert!(sub_list(&[]).contains(&json!({ "type": "pane.exited" })));
+    }
+
     #[test]
     fn subscriptions_include_explicit_agent_detection() {
         let subs = sub_list(&["w1:p1".to_string()]);
