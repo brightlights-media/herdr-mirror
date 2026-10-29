@@ -3,11 +3,12 @@
 > **Brightlights fork.** This is [brightlights-media/herdr-mirror](https://github.com/brightlights-media/herdr-mirror),
 > a fork of [nikok6/herdr-mirror](https://github.com/nikok6/herdr-mirror) that carries fixes not yet
 > upstream. The `brightlights` branch is upstream `main` with each fix merged in, and its releases are
-> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.3` and so on), so `herdr plugin list` tells it
+> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.4` and so on), so `herdr plugin list` tells it
 > apart from upstream. Install it with
-> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.3`.
+> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.4`.
 > Each fix lives on its own branch, one commit off upstream `main` (`fix/short-escape-window` sits
-> on `fix/lone-escape-held-until-next-key`), ready to offer upstream:
+> on `fix/lone-escape-held-until-next-key`, and `fix/placeholder-gate-transient-process-info` on
+> `fix/streamer-launch-never-types-into-live-pane`), ready to offer upstream:
 >
 > - [`fix/streamer-launch-never-types-into-live-pane`](https://github.com/brightlights-media/herdr-mirror/tree/fix/streamer-launch-never-types-into-live-pane):
 >   the streamer-launch retry no longer types `exec …` into a pane running another program; it checks
@@ -22,6 +23,15 @@
 > - [`fix/short-escape-window`](https://github.com/brightlights-media/herdr-mirror/tree/fix/short-escape-window):
 >   that lone Esc waits 20 ms, not 150 ms, for a possible mouse report or paste marker, so Esc
 >   (Claude Code's interrupt, vim's mode switch) is not sluggish in a mirror.
+> - [`fix/placeholder-gate-transient-process-info`](https://github.com/brightlights-media/herdr-mirror/tree/fix/placeholder-gate-transient-process-info):
+>   a `pane.process_info` answer missing its foreground fields (herdr sampled the pane mid-change)
+>   no longer abandons a new mirror pane's streamer launch, which left about one in seven a bare shell.
+> - [`perf/stream-through-host-master`](https://github.com/brightlights-media/herdr-mirror/tree/perf/stream-through-host-master):
+>   a pane stream rides the daemon's ssh master for its host when that master answers, skipping a
+>   full handshake per new pane; past sshd's `MaxSessions`, ssh connects directly by itself.
+> - [`perf/placeholder-plain-sh`](https://github.com/brightlights-media/herdr-mirror/tree/perf/placeholder-plain-sh):
+>   a mirror's placeholder pane starts a plain `sh` (`SHELL=/bin/sh` in its env) instead of the user's
+>   shell, so the streamer launches without waiting out the user's rc.
 
 A [herdr](https://herdr.dev) plugin that mirrors a remote herdr server's
 workspaces and agents into your local sidebar. One window shows the agents on
