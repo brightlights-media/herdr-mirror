@@ -202,6 +202,19 @@ fn walk_pane_ids(node: &LayoutNode, out: &mut Vec<String>) {
     }
 }
 
+/// Environment for a mirror's placeholder shell, the shell the streamer is
+/// exec'd into.
+///
+/// herdr starts a new pane's shell from the `SHELL` in its env, so this gives
+/// the placeholder a plain login `sh` (about 15 ms to a prompt) instead of the
+/// user's own shell, whose rc can take half a second or more. That wait is
+/// pure latency: nothing is typed into the pane until its shell is up, and the
+/// shell is replaced by the streamer at once. Only mirror placeholders get it;
+/// the user's own panes are untouched.
+fn placeholder_env() -> Value {
+    json!({ "SHELL": "/bin/sh" })
+}
+
 /// Layout tree as plain shell panes (no `command`, so herdr won't set
 /// `launch_argv` and treat them as agents); the streamer is exec'd in afterward.
 fn map_node(node: &LayoutNode, cwd: &str) -> Value {
@@ -210,6 +223,7 @@ fn map_node(node: &LayoutNode, cwd: &str) -> Value {
             "type": "pane",
             "label": label,
             "cwd": cwd,
+            "env": placeholder_env(),
         }),
         LayoutNode::Split { direction, ratio, first, second } => json!({
             "type": "split",
@@ -647,6 +661,7 @@ async fn split_mirror_pane(
         "direction": direction,
         "cwd": cwd,
         "focus": false,
+        "env": placeholder_env(),
     });
     if let Some(r) = ratio {
         params["ratio"] = json!(r);
@@ -1079,7 +1094,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
                 let created: Created = deps
                     .local
-                    .request_t("workspace.create", json!({ "label": label, "cwd": cwd, "focus": false }))
+                    .request_t(
+                        "workspace.create",
+                        json!({ "label": label, "cwd": cwd, "focus": false, "env": placeholder_env() }),
+                    )
                     .await?;
                 WsEntry {
                     local_id: created.workspace.workspace_id,
@@ -1769,6 +1787,20 @@ mod tests {
 
     fn split(direction: &str, ratio: f64, first: LayoutNode, second: LayoutNode) -> LayoutNode {
         LayoutNode::Split { direction: direction.into(), ratio, first: Box::new(first), second: Box::new(second) }
+    }
+
+    /// Every placeholder in an applied layout starts a plain `sh`, not the
+    /// user's shell: its startup is the wait before the streamer launches.
+    #[test]
+    fn every_layout_placeholder_starts_a_plain_sh() {
+        let tree = split("right", 0.5, leaf("w1:p1"), split("down", 0.5, leaf("w1:p2"), leaf("w1:p3")));
+        let applied = map_node(&tree, "/state/.mirror-pane");
+        let leaves = [&applied["first"], &applied["second"]["first"], &applied["second"]["second"]];
+        for pane in leaves {
+            assert_eq!(pane["type"], "pane");
+            assert_eq!(pane["env"]["SHELL"], "/bin/sh");
+            assert!(pane.get("command").is_none(), "a command would make it an agent row");
+        }
     }
 
     /// The fallback path, used only for a pane `layout_sync::plan_placements`
