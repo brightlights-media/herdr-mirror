@@ -3,10 +3,11 @@
 > **Brightlights fork.** This is [brightlights-media/herdr-mirror](https://github.com/brightlights-media/herdr-mirror),
 > a fork of [nikok6/herdr-mirror](https://github.com/nikok6/herdr-mirror) that carries fixes not yet
 > upstream. The `brightlights` branch is upstream `main` with each fix merged in, and its releases are
-> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.2` and so on), so `herdr plugin list` tells it
+> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.3` and so on), so `herdr plugin list` tells it
 > apart from upstream. Install it with
-> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.2`.
-> Each fix lives on its own branch, one commit off upstream `main`, ready to offer upstream:
+> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.3`.
+> Each fix lives on its own branch, one commit off upstream `main` (`fix/short-escape-window` sits
+> on `fix/lone-escape-held-until-next-key`), ready to offer upstream:
 >
 > - [`fix/streamer-launch-never-types-into-live-pane`](https://github.com/brightlights-media/herdr-mirror/tree/fix/streamer-launch-never-types-into-live-pane):
 >   the streamer-launch retry no longer types `exec …` into a pane running another program; it checks
@@ -18,6 +19,9 @@
 > - [`fix/log-unsynced-mirrors-of-dropped-hosts`](https://github.com/brightlights-media/herdr-mirror/tree/fix/log-unsynced-mirrors-of-dropped-hosts):
 >   at start, the daemon names any host removed from `hosts.toml` whose mirrors are still on screen,
 >   instead of going silent on it.
+> - [`fix/short-escape-window`](https://github.com/brightlights-media/herdr-mirror/tree/fix/short-escape-window):
+>   that lone Esc waits 20 ms, not 150 ms, for a possible mouse report or paste marker, so Esc
+>   (Claude Code's interrupt, vim's mode switch) is not sluggish in a mirror.
 
 A [herdr](https://herdr.dev) plugin that mirrors a remote herdr server's
 workspaces and agents into your local sidebar. One window shows the agents on
