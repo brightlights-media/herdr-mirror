@@ -188,6 +188,86 @@ pub fn unconfigured_hosts(state_dir: &Path, configured: &[&str]) -> Vec<(String,
     out
 }
 
+/// A local user's ask to focus the mirror of a remote pane they just created
+/// (`remote-split`, `remote-tab`), left for the daemon, which maps it.
+///
+/// Only the remote-create actions write one, so a pane an agent or script
+/// splits inside the sandbox is mirrored without taking focus.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FocusRequest {
+    pub remote_pane_id: String,
+    /// the mirror workspace the action was invoked from
+    pub local_workspace_id: String,
+    pub at_ms: u64,
+}
+
+/// How long a focus request waits for its mapping. Past this the user has
+/// likely moved on, and a late mapping must not pull them back.
+pub const FOCUS_REQUEST_TTL_MS: u64 = 5_000;
+
+pub fn focus_request_path(state_dir: &Path, host: &str) -> PathBuf {
+    state_dir.join(format!("{host}-focus.json"))
+}
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Leave a focus request for the daemon. One per host: a newer action
+/// replaces an older one, as a newer native split would take focus.
+pub fn request_focus(state_dir: &Path, host: &str, req: &FocusRequest) -> Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let path = focus_request_path(state_dir, host);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string(req)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+pub fn load_focus_request(state_dir: &Path, host: &str) -> Option<FocusRequest> {
+    let text = std::fs::read_to_string(focus_request_path(state_dir, host)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn clear_focus_request(state_dir: &Path, host: &str) {
+    let _ = std::fs::remove_file(focus_request_path(state_dir, host));
+}
+
+/// What to do with a pending focus request after a converge.
+#[derive(Debug, PartialEq)]
+pub enum FocusStep {
+    /// its pane isn't mirrored yet: keep it for the next converge
+    Wait,
+    /// too old, or the user left the workspace it was asked from: discard it
+    Drop,
+    /// focus this local mirror pane, then discard the request
+    Focus(String),
+}
+
+/// `focused_workspace` is the local herdr's focused workspace now. Only the
+/// requested remote pane's mirror is ever focused, and only while the user is
+/// still in the workspace they asked from.
+pub fn focus_step(
+    req: &FocusRequest,
+    state: &HostState,
+    focused_workspace: Option<&str>,
+    now_ms: u64,
+) -> FocusStep {
+    if now_ms.saturating_sub(req.at_ms) > FOCUS_REQUEST_TTL_MS {
+        return FocusStep::Drop;
+    }
+    if focused_workspace != Some(req.local_workspace_id.as_str()) {
+        return FocusStep::Drop;
+    }
+    match state.panes.get(&req.remote_pane_id) {
+        Some(e) if !e.is_tombstoned() => FocusStep::Focus(e.local_id.clone()),
+        _ => FocusStep::Wait,
+    }
+}
+
 pub fn load_state(state_dir: &Path, host: &str) -> HostState {
     std::fs::read_to_string(state_path(state_dir, host))
         .ok()
@@ -318,6 +398,67 @@ mod tests {
         assert_eq!(unconfigured_hosts(&dir, &["kept"]), vec![("dropped".to_string(), 2)]);
         assert!(unconfigured_hosts(&dir, &["kept", "dropped"]).is_empty());
         assert!(unconfigured_hosts(&dir.join("missing"), &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn focus_state(mapped: &[(&str, &str)]) -> HostState {
+        let mut state = HostState::default();
+        for (rid, lid) in mapped {
+            state.panes.insert(
+                rid.to_string(),
+                PaneEntry { local_id: lid.to_string(), tombstone: None, seq: 0, reported: None },
+            );
+        }
+        state
+    }
+
+    fn focus_req(at_ms: u64) -> FocusRequest {
+        FocusRequest { remote_pane_id: "w1:p5".into(), local_workspace_id: "w9".into(), at_ms }
+    }
+
+    /// The mirror of the pane the user asked for is focused once it is mapped.
+    #[test]
+    fn a_pending_focus_lands_on_the_mirror_once_mapped() {
+        let req = focus_req(1_000);
+        assert_eq!(focus_step(&req, &focus_state(&[]), Some("w9"), 1_200), FocusStep::Wait);
+        assert_eq!(
+            focus_step(&req, &focus_state(&[("w1:p5", "w9:p3")]), Some("w9"), 1_400),
+            FocusStep::Focus("w9:p3".into())
+        );
+    }
+
+    /// A mapping that comes late never pulls the user back.
+    #[test]
+    fn a_focus_request_expires() {
+        let req = focus_req(1_000);
+        let mapped = focus_state(&[("w1:p5", "w9:p3")]);
+        assert_eq!(focus_step(&req, &mapped, Some("w9"), 1_000 + FOCUS_REQUEST_TTL_MS), FocusStep::Focus("w9:p3".into()));
+        assert_eq!(focus_step(&req, &mapped, Some("w9"), 1_001 + FOCUS_REQUEST_TTL_MS), FocusStep::Drop);
+    }
+
+    /// The user moved to another workspace: their focus is left where it is.
+    #[test]
+    fn no_focus_after_the_user_left_the_workspace() {
+        let req = focus_req(1_000);
+        let mapped = focus_state(&[("w1:p5", "w9:p3")]);
+        assert_eq!(focus_step(&req, &mapped, Some("w4"), 1_100), FocusStep::Drop);
+        assert_eq!(focus_step(&req, &mapped, None, 1_100), FocusStep::Drop);
+    }
+
+    /// A pane split inside the sandbox by something else (an agent, a script)
+    /// is mapped without focus: only the requested pane is ever focused.
+    #[test]
+    fn a_remote_originated_pane_is_not_focused() {
+        let req = focus_req(1_000);
+        let other = focus_state(&[("w1:p6", "w9:p4")]);
+        assert_eq!(focus_step(&req, &other, Some("w9"), 1_100), FocusStep::Wait);
+        let dir = std::env::temp_dir().join(format!("hm-focus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(load_focus_request(&dir, "vps"), None, "no request, no focus");
+        request_focus(&dir, "vps", &req).unwrap();
+        assert_eq!(load_focus_request(&dir, "vps"), Some(req));
+        clear_focus_request(&dir, "vps");
+        assert_eq!(load_focus_request(&dir, "vps"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

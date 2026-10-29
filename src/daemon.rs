@@ -323,6 +323,7 @@ async fn run_connected(
     let mut stream = remote.subscribe(sub_list(&[])).await?;
     let mut subscribed_key = String::from("<broadcast>");
     let state = converge(&deps).await?;
+    apply_focus_request(ctx, &state).await;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
 
@@ -395,9 +396,38 @@ async fn run_connected(
                     )
                     .await;
                     let state = converge(&deps).await?;
+                    apply_focus_request(ctx, &state).await;
                     // pane set may have changed
                     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
                 }
+            }
+        }
+    }
+}
+
+/// Focus the mirror of a pane the local user just created on the remote
+/// (`state::FocusRequest`), once this converge has mapped it, as a native
+/// split or new tab would. `pane.focus` also switches to its tab.
+async fn apply_focus_request(ctx: &HostCtx, state: &HostState) {
+    let Some(req) = crate::state::load_focus_request(&ctx.env_state_dir, &ctx.host.name) else {
+        return;
+    };
+    let focused = ctx
+        .local
+        .request("workspace.get", json!({ "workspace_id": req.local_workspace_id }))
+        .await
+        .ok()
+        .filter(|v| v.pointer("/workspace/focused").and_then(Value::as_bool) == Some(true))
+        .map(|_| req.local_workspace_id.as_str());
+    match crate::state::focus_step(&req, state, focused, crate::state::now_ms()) {
+        crate::state::FocusStep::Wait => {}
+        crate::state::FocusStep::Drop => {
+            crate::state::clear_focus_request(&ctx.env_state_dir, &ctx.host.name)
+        }
+        crate::state::FocusStep::Focus(pane_id) => {
+            crate::state::clear_focus_request(&ctx.env_state_dir, &ctx.host.name);
+            if let Err(e) = ctx.local.request("pane.focus", json!({ "pane_id": pane_id })).await {
+                ctx.log.log(&format!("[{}] could not focus new mirror {pane_id}: {e}", ctx.host.name));
             }
         }
     }
