@@ -784,10 +784,10 @@ enum ShellGate {
     /// the shell herdr started there is in the foreground: type
     Ready,
     /// that shell is running something in the foreground (a startup-file
-    /// command, a job): wait for it
+    /// command, a job), or this answer didn't say: wait and ask again
     Busy,
     /// the shell's pid runs something else now (a streamer `exec`d over it),
-    /// or the pane can't be inspected: never type
+    /// or the pane is gone: never type
     Closed,
 }
 
@@ -829,11 +829,15 @@ fn shell_gate(result: &Value) -> ShellGate {
         foreground_process_group_id: i64,
         foreground_processes: Vec<Proc>,
     }
+    // herdr samples the pane's processes, and an answer taken while they
+    // change can come back without the foreground fields. That says nothing
+    // about the pane, so ask again: giving up here leaves a new mirror pane a
+    // bare shell for good. Waiting never types, so it is safe either way.
     let Some(info) = result
         .get("process_info")
         .and_then(|v| serde_json::from_value::<Info>(v.clone()).ok())
     else {
-        return ShellGate::Closed;
+        return ShellGate::Busy;
     };
     match info.foreground_processes.iter().find(|p| p.pid == info.shell_pid) {
         Some(p) if !crate::foreground::is_shell(&p.name) => ShellGate::Closed,
@@ -1973,8 +1977,13 @@ mod tests {
         assert_eq!(shell_gate(&process_info(100, 200, &[(200, "vim")])), Busy);
         // the streamer exec'd over the shell: same pid, new name
         assert_eq!(shell_gate(&process_info(100, 100, &[(100, "herdr-mirror")])), Closed);
-        // unparseable answers never type
-        assert_eq!(shell_gate(&json!({ "type": "pane_process_info" })), Closed);
+        // an answer without the foreground fields (herdr sampled the pane
+        // mid-change, seen at birth) is asked again, never typed into
+        assert_eq!(shell_gate(&json!({ "type": "pane_process_info" })), Busy);
+        assert_eq!(
+            shell_gate(&json!({ "process_info": { "pane_id": "w2:p18", "shell_pid": 100 } })),
+            Busy
+        );
     }
 
     /// Characterization test: the ssh pane argv is a cross-process contract.
