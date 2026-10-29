@@ -162,6 +162,31 @@ pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {
     state_dir.join(format!("{host}-map.json"))
 }
 
+/// Hosts that left mirror workspaces on screen but are not in `configured`.
+///
+/// The daemon builds its host tasks from the config once, at start, so a host
+/// dropped from hosts.toml (by hand, or by a tool that writes it) gets no task:
+/// its mirrors stay up, frozen, and nothing is ever logged for it again. This
+/// names them so the cause is in the log rather than inferred from silence.
+/// Returns `(host, live mirror workspaces)`, sorted by host.
+pub fn unconfigured_hosts(state_dir: &Path, configured: &[&str]) -> Vec<(String, usize)> {
+    let Ok(dir) = std::fs::read_dir(state_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, usize)> = dir
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|n| n.strip_suffix("-map.json").map(str::to_string))
+        .filter(|h| !configured.contains(&h.as_str()))
+        .map(|h| {
+            let live = load_state(state_dir, &h).workspaces.values().filter(|w| !w.is_tombstoned()).count();
+            (h, live)
+        })
+        .filter(|(_, live)| *live > 0)
+        .collect();
+    out.sort();
+    out
+}
+
 pub fn load_state(state_dir: &Path, host: &str) -> HostState {
     std::fs::read_to_string(state_path(state_dir, host))
         .ok()
@@ -260,6 +285,35 @@ mod tests {
         assert_eq!(unsafe { libc::utimes(c.as_ptr(), [t, t].as_ptr()) }, 0);
         assert_eq!(take_pane_hint(&dir, "wBT:p2"), None);
         assert!(!path.exists(), "stale or not, it is consumed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host dropped from the config gets no task, so the daemon never logs it
+    /// again; its mirrors freeze in silence. The start line must name it.
+    #[test]
+    fn a_host_dropped_from_the_config_is_named_with_its_live_mirrors() {
+        let dir = std::env::temp_dir().join(format!("hm-unconfigured-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = |tomb: Option<bool>| WsEntry {
+            local_id: "w9".into(),
+            tombstone: tomb,
+            root_tab_local_id: None,
+            last_remote_label: None,
+        };
+        let with = |entries: Vec<(&str, WsEntry)>| HostState {
+            workspaces: entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            ..HostState::default()
+        };
+        save_state(&dir, "kept", &with(vec![("w1", ws(None))])).unwrap();
+        save_state(&dir, "dropped", &with(vec![("w1", ws(None)), ("w2", ws(None)), ("w3", ws(Some(true)))]))
+            .unwrap();
+        // nothing left on screen: dropping it is not worth a line on every start
+        save_state(&dir, "all-closed", &with(vec![("w1", ws(Some(true)))])).unwrap();
+        std::fs::write(dir.join("dropped.ctl"), "").unwrap();
+
+        assert_eq!(unconfigured_hosts(&dir, &["kept"]), vec![("dropped".to_string(), 2)]);
+        assert!(unconfigured_hosts(&dir, &["kept", "dropped"]).is_empty());
+        assert!(unconfigured_hosts(&dir.join("missing"), &[]).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

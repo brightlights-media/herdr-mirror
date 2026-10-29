@@ -669,6 +669,12 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     for w in &config.warnings {
         log.log(&format!("warning: {w}"));
     }
+    let configured: Vec<&str> = config.hosts.iter().map(|h| h.name.as_str()).collect();
+    for (host, live) in crate::state::unconfigured_hosts(&env.state_dir, &configured) {
+        log.log(&format!(
+            "[{host}] not in the config — its {live} mirror workspace(s) stay on screen but are not synced until it is added back"
+        ));
+    }
 
     let local = ApiClient::connect(&env.local_socket).await?;
     // Detect-and-report only: a broken CLI link means every keybinding through
