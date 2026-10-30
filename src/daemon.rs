@@ -182,6 +182,13 @@ const BROADCAST_SUBS: &[&str] = &[
     "layout.updated",
 ];
 
+/// How long the first structural remote event waits before the full converge
+/// it triggers; later events in the window join it rather than extend it. A
+/// split's `pane_created` and `layout_updated` land 0-30 ms apart, so 50 ms
+/// still reconciles them once, where 500 ms was most of the time a new remote
+/// pane took to appear locally.
+const STRUCTURE_DEBOUNCE: Duration = Duration::from_millis(50);
+
 fn sub_list(pane_ids: &[String]) -> Vec<Value> {
     let mut subs: Vec<Value> = BROADCAST_SUBS.iter().map(|t| json!({ "type": t })).collect();
     subs.extend(pane_ids.iter().map(|p| json!({ "type": "pane.agent_status_changed", "pane_id": p })));
@@ -324,7 +331,7 @@ async fn run_connected(
                 match ev {
                     None => return Err(err("event stream closed")),
                     // status changes take the fast-path; structure changes
-                    // need a full reconcile (debounced 500ms)
+                    // need a full reconcile (debounced STRUCTURE_DEBOUNCE)
                     Some(e) if e.event == "pane_agent_status_changed" => {
                         if let Some(pid) = e.data.get("pane_id").and_then(|v| v.as_str()) {
                             // coalesce: keep only the latest per pane
@@ -346,7 +353,7 @@ async fn run_connected(
                         }
                     }
                     Some(_) => {
-                        converge_at.get_or_insert(Instant::now() + Duration::from_millis(500));
+                        converge_at.get_or_insert(Instant::now() + STRUCTURE_DEBOUNCE);
                     }
                 }
             }
