@@ -314,10 +314,13 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
+# label = "prefixed"     # default: a mirror workspace reads "<prefix>: <label>".
+                         # "remote" shows the remote label alone (see below).
 
 [hosts.work]
 target = "work"
 # prefix = "work"                    # sidebar prefix (default: the host key)
+# label = "remote"                   # per-host override of the global label
 # remote_bin = "~/.local/bin/herdr"  # remote path if it's not on the remote PATH
 # session = "project"                # mirror a named herdr session on this host
                                      # (`herdr --session project`)
@@ -335,6 +338,30 @@ target = "work"
 [hosts.vps]                          # add more hosts freely; each is independent
 target = "ssh://niko@203.0.113.7:2222"
 ```
+
+### Workspace labels
+
+With `label = "prefixed"` (the default) a mirror workspace reads
+`<prefix>: <remote label>`. With `label = "remote"` it reads the remote label
+alone, so a remote workspace named `🟩 vm-3` shows as `🟩 vm-3`. A remote
+workspace still carrying herdr's default name (the name of a directory one of
+its panes is in: a host's own `brightlights`, a fresh sandbox's `app`) shows the
+host's `prefix` instead, since the bare name would read as a local workspace of
+the same name.
+
+The label is for reading only. The daemon tells mirrors apart by its id map
+(`~/.local/state/herdr-mirror/<host>-map.json`): that is how it groups the
+sidebar per host, finds the mirror a remote-create action made, and adopts a
+crash orphan (only one no host maps and made only of mirror panes). Two hosts,
+or a host and a local workspace, may show the same label.
+
+Renaming a mirror workspace locally renames the remote workspace. Under
+`prefixed` the `<prefix>: ` is stripped first; under `remote` the new name goes
+over verbatim. A label the daemon stamped itself is never pushed: after a
+change of `prefix` or `label`, a mirror still carrying its old stamp, or any
+`<prefix>: <remote label>` form, is restamped from the remote instead, as is
+any rename made before this build first stamped the mirror. A remote rename
+always wins over an older local one.
 
 ## Devcontainer
 
@@ -425,8 +452,9 @@ identified as disposable merely because their directory matches.
   remote repo's state, so mirror workspaces show no git chip. The remote's real
   branch and status stay visible in the streamed pane's prompt.
 - **No custom sidebar UI** (plugin API limitation): mirrors carry a `<host>: `
-  label prefix and the daemon keeps them ordered into per-host groups, but it
-  can't render a richer affordance (group headers, collapse, colour).
+  label prefix (or none, with `label = "remote"`) and the daemon keeps them
+  ordered into per-host groups, but it can't render a richer affordance (group
+  headers, collapse, colour).
 - **Remote must be reachable and running herdr**; the daemon surfaces a
   readable status if a host is down or on too old a version.
 - **ssh hosts whose sshd won't service streamlocal forwards** (some embedded

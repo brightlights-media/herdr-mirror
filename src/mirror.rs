@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::ApiClient;
-use crate::config::HostConfig;
+use crate::config::{HostConfig, LabelStyle};
 use crate::state::{load_state, save_state, HostState, PaneEntry, WsEntry};
 use crate::util::{Logger, Result};
 
@@ -31,6 +31,34 @@ pub struct WsInfo {
     /// pre-0.7.4 remote never sends this.
     #[serde(default)]
     pub tokens: HashMap<String, String>,
+    /// the git checkout the workspace was opened in, when herdr knows one
+    #[serde(default)]
+    pub worktree: Option<WsWorktree>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WsWorktree {
+    pub checkout_path: Option<String>,
+    pub repo_name: Option<String>,
+}
+
+fn dir_name(path: &str) -> Option<&str> {
+    std::path::Path::new(path).file_name()?.to_str()
+}
+
+impl WsInfo {
+    /// Still named the way herdr names a new workspace: after the directory it
+    /// was opened in — one of its panes' directories, or its checkout's.
+    fn has_default_name(&self, panes: &[&PaneInfo]) -> bool {
+        let label = Some(self.label.as_str());
+        let checkout = self.worktree.as_ref().is_some_and(|w| {
+            w.checkout_path.as_deref().and_then(dir_name) == label || w.repo_name.as_deref() == label
+        });
+        checkout
+            || panes.iter().any(|p| {
+                p.cwd.as_deref().and_then(dir_name) == label || p.foreground_cwd.as_deref().and_then(dir_name) == label
+            })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -386,21 +414,45 @@ enum LabelAction {
     RestampLocal,
 }
 
-/// Two-way rename resolution. `last_remote` is the remote label as of the
-/// previous converge (None = pre-upgrade state file / first sight: remote wins).
+/// How a mirror's local label is formed from its remote's.
+#[derive(Debug, Clone, Copy)]
+enum LabelForm<'a> {
+    /// tabs carry the remote label verbatim
+    Tab,
+    /// workspaces follow the host's `label` style (see `ws_label`)
+    Workspace { prefix: &'a str, style: LabelStyle },
+}
+
+/// The local label a workspace mirror carries: `<prefix>: <remote label>`, or
+/// under `label = "remote"` the remote label alone — the host's prefix when
+/// the remote still has herdr's default name (or none), which would otherwise
+/// read as a local workspace of the same name.
+fn ws_label(host: &HostConfig, rws: &WsInfo, panes: &[&PaneInfo]) -> String {
+    match host.label {
+        LabelStyle::Prefixed => format!("{}: {}", host.prefix, rws.label),
+        LabelStyle::Remote if rws.label.trim().is_empty() || rws.has_default_name(panes) => host.prefix.clone(),
+        LabelStyle::Remote => rws.label.clone(),
+    }
+}
+
+/// Two-way rename resolution. `expected` is the label the daemon stamps for
+/// `remote_label` now; `last_remote` the remote label and `last_local` the
+/// local label it stamped as of the previous converge (None = state from an
+/// older build, or first sight).
 ///
-/// `prefix` is `Some` for workspaces, whose mirrors carry the "<prefix>: " form,
-/// and `None` for tabs, which carry the remote's label verbatim.
+/// A local label that is not `expected` is a user rename to push only when the
+/// remote is unchanged and the label is not one the daemon stamped itself:
+/// neither its last stamp (a prefix or `label` style changed since) nor a
+/// workspace stamp `<prefix>: <remote label>` under any prefix. Pushing either
+/// would write a prefixed or doubled label onto the remote.
 fn resolve_label(
-    prefix: Option<&str>,
+    form: LabelForm,
+    expected: &str,
     remote_label: &str,
     local_label: &str,
     last_remote: Option<&str>,
+    last_local: Option<&str>,
 ) -> LabelAction {
-    let expected = match prefix {
-        Some(p) => format!("{p}: {remote_label}"),
-        None => remote_label.to_string(),
-    };
     if local_label == expected {
         return LabelAction::InSync;
     }
@@ -408,16 +460,36 @@ fn resolve_label(
         // remote changed since we last stamped (or no history) — remote wins
         return LabelAction::RestampLocal;
     }
-    // remote unchanged, local differs → this is a user rename. Accept it with
-    // or without the "<prefix>: " convention; empty/degenerate names restamp.
-    let stripped = match prefix {
-        Some(p) => local_label.strip_prefix(&format!("{p}: ")).unwrap_or(local_label).trim(),
-        None => local_label.trim(),
+    if last_local == Some(local_label) {
+        return LabelAction::RestampLocal;
+    }
+    // remote unchanged, local differs → this is a user rename; empty or
+    // degenerate names restamp.
+    let name = match form {
+        LabelForm::Tab => local_label.trim(),
+        LabelForm::Workspace { prefix, style } => {
+            if local_label.ends_with(&format!(": {remote_label}")) {
+                return LabelAction::RestampLocal;
+            }
+            match style {
+                // accepted with or without the "<prefix>: " convention
+                LabelStyle::Prefixed => local_label.strip_prefix(&format!("{prefix}: ")).unwrap_or(local_label).trim(),
+                // the label is the remote's own, so a rename pushes verbatim —
+                // but only once this build has stamped it: with no record, an
+                // older build's "<prefix>: " stamp can't be told from a name
+                LabelStyle::Remote => {
+                    if last_local.is_none() || local_label.starts_with(&format!("{prefix}: ")) {
+                        return LabelAction::RestampLocal;
+                    }
+                    local_label.trim()
+                }
+            }
+        }
     };
-    if stripped.is_empty() || stripped == remote_label {
+    if name.is_empty() || name == remote_label {
         LabelAction::RestampLocal
     } else {
-        LabelAction::PushRemote(stripped.to_string())
+        LabelAction::PushRemote(name.to_string())
     }
 }
 
@@ -767,6 +839,13 @@ fn pane_is_mirror(p: &PaneInfo) -> bool {
     is_marker(&p.foreground_cwd) || is_marker(&p.cwd)
 }
 
+/// Is local workspace `ws` made only of mirror panes — one the daemon built,
+/// never a workspace someone opened?
+fn is_placeholder_workspace(panes: &[PaneInfo], ws: &str) -> bool {
+    let mut in_ws = panes.iter().filter(|p| p.workspace_id == ws).peekable();
+    in_ws.peek().is_some() && in_ws.all(pane_is_mirror)
+}
+
 // --- the converge pass ---
 
 /// A fresh local id just entered the map (mirror created or adopted). Two
@@ -985,7 +1064,9 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if mirror_ws_ids.contains(&rws.workspace_id) {
             continue;
         }
-        let label = format!("{}: {}", host.prefix, rws.label);
+        let rws_panes: &[&PaneInfo] = panes_by_ws.get(rws.workspace_id.as_str()).map_or(&[], |v| v.as_slice());
+        let label = ws_label(host, rws, rws_panes);
+        let form = LabelForm::Workspace { prefix: &host.prefix, style: host.label };
         if state.workspaces.get(&rws.workspace_id).is_some_and(|e| e.is_tombstoned()) {
             continue;
         }
@@ -997,11 +1078,18 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if let Some(entry) = existing {
             let local_ws = local_snap.workspaces.iter().find(|w| w.workspace_id == entry.local_id);
             if let Some(lws) = local_ws {
-                match resolve_label(Some(&host.prefix), &rws.label, &lws.label, entry.last_remote_label.as_deref()) {
+                match resolve_label(
+                    form,
+                    &label,
+                    &rws.label,
+                    &lws.label,
+                    entry.last_remote_label.as_deref(),
+                    entry.last_local_label.as_deref(),
+                ) {
                     LabelAction::PushRemote(new_remote) => {
                         // the user renamed the mirror → the rename is intent for
                         // the REMOTE workspace; push it there and restamp local
-                        // with the canonical "<prefix>: <name>" form
+                        // with the label the new remote name stamps
                         log.log(&format!(
                             "local rename of {} → pushing \"{new_remote}\" to remote {}",
                             lws.label, rws.workspace_id
@@ -1012,7 +1100,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                                 json!({ "workspace_id": rws.workspace_id, "label": new_remote }),
                             )
                             .await?;
-                        let stamped = format!("{}: {}", host.prefix, new_remote);
+                        let stamped = ws_label(host, &WsInfo { label: new_remote.clone(), ..rws.clone() }, rws_panes);
                         if lws.label != stamped {
                             deps.local
                                 .request("workspace.rename", json!({ "workspace_id": entry.local_id, "label": stamped }))
@@ -1020,6 +1108,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         }
                         if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
                             e.last_remote_label = Some(new_remote);
+                            e.last_local_label = Some(stamped);
                         }
                     }
                     LabelAction::RestampLocal => {
@@ -1028,24 +1117,33 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             .await?;
                         if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
                             e.last_remote_label = Some(rws.label.clone());
+                            e.last_local_label = Some(label.clone());
                         }
                     }
                     LabelAction::InSync => {
-                        if entry.last_remote_label.as_deref() != Some(rws.label.as_str()) {
+                        if entry.last_remote_label.as_deref() != Some(rws.label.as_str())
+                            || entry.last_local_label.as_deref() != Some(label.as_str())
+                        {
                             if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
                                 e.last_remote_label = Some(rws.label.clone());
+                                e.last_local_label = Some(label.clone());
                             }
                         }
                     }
                 }
             }
         } else {
-            // adopt a label-matching unmapped local workspace (orphan from a crash)
-            let mapped: HashSet<&str> = state.workspaces.values().map(|e| e.local_id.as_str()).collect();
-            let orphan = local_snap
-                .workspaces
-                .iter()
-                .find(|w| w.label == label && !mapped.contains(w.workspace_id.as_str()));
+            // adopt a label-matching orphan from a crash: a workspace no host
+            // maps whose panes are all mirror placeholders. A label alone can't
+            // say it is ours — under `label = "remote"` a local workspace or
+            // another host's mirror may carry the same one.
+            let mapped = crate::state::mapped_local_workspaces(&deps.state_dir);
+            let orphan = local_snap.workspaces.iter().find(|w| {
+                w.label == label
+                    && !mapped.contains(&w.workspace_id)
+                    && !state.workspaces.values().any(|e| e.local_id == w.workspace_id)
+                    && is_placeholder_workspace(&local_snap.panes, &w.workspace_id)
+            });
             let entry = if let Some(orphan) = orphan {
                 log.log(&format!("adopting existing workspace {label} ({})", orphan.workspace_id));
                 WsEntry {
@@ -1057,6 +1155,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         None
                     },
                     last_remote_label: Some(rws.label.clone()),
+                    last_local_label: Some(label.clone()),
                 }
             } else {
                 log.log(&format!("creating mirror workspace {label}"));
@@ -1086,6 +1185,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     tombstone: None,
                     root_tab_local_id: Some(created.tab.tab_id),
                     last_remote_label: Some(rws.label.clone()),
+                    last_local_label: Some(label.clone()),
                 }
             };
             local_ws_ids.insert(entry.local_id.clone());
@@ -1334,7 +1434,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             // rename is intent for the REMOTE tab, and only a remote that moved
             // since we last stamped may overwrite the local label.
             if let Some(ltab) = local_tab {
-                match resolve_label(None, &rtab.label, &ltab.label, entry.last_remote_label.as_deref()) {
+                match resolve_label(
+                    LabelForm::Tab,
+                    &rtab.label,
+                    &rtab.label,
+                    &ltab.label,
+                    entry.last_remote_label.as_deref(),
+                    None,
+                ) {
                     LabelAction::PushRemote(new_remote) => {
                         log.log(&format!(
                             "local rename of tab {tab_local} → pushing \"{new_remote}\" to remote {}",
@@ -1628,15 +1735,40 @@ async fn move_ws(local: &ApiClient, ws: &str, insert_index: usize) -> bool {
         .is_ok()
 }
 
-/// rank a workspace by its label: local (no `<prefix>: `) sorts first (0), then
-/// each host's mirrors by config order (i+1). First matching prefix wins.
-fn ws_rank(label: &str, prefixes: &[String]) -> usize {
-    for (i, p) in prefixes.iter().enumerate() {
-        if label.starts_with(&format!("{p}: ")) {
-            return i + 1;
-        }
+/// One host's mirror workspaces, for grouping: the local ids its map holds,
+/// and for a `prefixed` host its label prefix.
+struct HostGroup {
+    owned: HashSet<String>,
+    prefix: Option<String>,
+}
+
+fn host_groups(state_dir: &std::path::Path, hosts: &[HostConfig]) -> Vec<HostGroup> {
+    hosts
+        .iter()
+        .map(|h| HostGroup {
+            owned: load_state(state_dir, &h.name)
+                .workspaces
+                .into_values()
+                .filter(|e| !e.is_tombstoned())
+                .map(|e| e.local_id)
+                .collect(),
+            prefix: (h.label == LabelStyle::Prefixed).then(|| h.prefix.clone()),
+        })
+        .collect()
+}
+
+/// rank a workspace: local sorts first (0), then each host's mirrors by config
+/// order (i+1). The id maps decide, so a label never has to name its host; a
+/// `prefixed` host's label also counts, for the moment between creating a
+/// mirror and writing its map.
+fn ws_rank(id: &str, label: &str, groups: &[HostGroup]) -> usize {
+    if let Some(i) = groups.iter().position(|g| g.owned.contains(id)) {
+        return i + 1;
     }
-    0
+    groups
+        .iter()
+        .position(|g| g.prefix.as_ref().is_some_and(|p| label.starts_with(&format!("{p}: "))))
+        .map_or(0, |i| i + 1)
 }
 
 /// Pure planner: given the current `(workspace_id, rank)` order, return the
@@ -1688,14 +1820,18 @@ fn plan_regroup(current: &[(String, usize)]) -> Vec<(String, usize)> {
 }
 
 /// Keep the local sidebar grouped: local (non-mirror) workspaces first, then each
-/// host's mirror workspaces contiguous in config order. Classifies by the
-/// `<prefix>: ` label the mirror sets, and only ever moves mirror rows — local
+/// host's mirror workspaces contiguous in config order. Classifies by each
+/// host's id map (see `ws_rank`), and only ever moves mirror rows — local
 /// workspaces are never reordered (they group as a side effect of mirror rows
 /// being pushed below them). Idempotent: issues no moves when already grouped.
-pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logger) {
+pub async fn regroup_sidebar(local: &ApiClient, hosts: &[HostConfig], state_dir: &std::path::Path, log: &Logger) {
     let Ok(snap) = fetch_snapshot(local).await else { return };
-    let current: Vec<(String, usize)> =
-        snap.workspaces.iter().map(|w| (w.workspace_id.clone(), ws_rank(&w.label, prefixes))).collect();
+    let groups = host_groups(state_dir, hosts);
+    let current: Vec<(String, usize)> = snap
+        .workspaces
+        .iter()
+        .map(|w| (w.workspace_id.clone(), ws_rank(&w.workspace_id, &w.label, &groups)))
+        .collect();
     for (ws, insert_index) in plan_regroup(&current) {
         if !move_ws(local, &ws, insert_index).await {
             log.log(&format!("regroup: move {ws} failed"));
@@ -1713,6 +1849,7 @@ mod tests {
             tombstone: tomb.then_some(true),
             root_tab_local_id: None,
             last_remote_label: None,
+            last_local_label: None,
         }
     }
 
@@ -1754,6 +1891,7 @@ mod tests {
             kind: crate::config::HostKind::Ssh,
             docker_bin: "docker".into(),
             prefix: "vps".into(),
+            label: crate::config::LabelStyle::Prefixed,
             remote_bin: None,
             session: None,
             always_control: true,
@@ -1994,26 +2132,140 @@ mod tests {
         assert_eq!((parsed.cols, parsed.rows), (240, 72));
     }
 
+    fn prefixed(remote: &str, local: &str, last_remote: Option<&str>, last_local: Option<&str>) -> LabelAction {
+        let form = LabelForm::Workspace { prefix: "pm", style: LabelStyle::Prefixed };
+        resolve_label(form, &format!("pm: {remote}"), remote, local, last_remote, last_local)
+    }
+
+    fn bare(remote: &str, local: &str, last_remote: Option<&str>, last_local: Option<&str>) -> LabelAction {
+        let form = LabelForm::Workspace { prefix: "pm", style: LabelStyle::Remote };
+        resolve_label(form, remote, remote, local, last_remote, last_local)
+    }
+
+    fn tab(remote: &str, local: &str, last_remote: Option<&str>) -> LabelAction {
+        resolve_label(LabelForm::Tab, remote, remote, local, last_remote, None)
+    }
+
     #[test]
     fn ws_label_two_way_rename() {
         // in sync → nothing
-        assert_eq!(resolve_label(Some("pm"), "scratch", "pm: scratch", Some("scratch")), LabelAction::InSync);
+        assert_eq!(prefixed("scratch", "pm: scratch", Some("scratch"), None), LabelAction::InSync);
         // remote renamed (history differs) → remote wins
-        assert_eq!(resolve_label(Some("pm"), "runs", "pm: scratch", Some("scratch")), LabelAction::RestampLocal);
+        assert_eq!(prefixed("runs", "pm: scratch", Some("scratch"), None), LabelAction::RestampLocal);
         // no history (pre-upgrade state file) → remote wins once
-        assert_eq!(resolve_label(Some("pm"), "scratch", "pm: LLMs", None), LabelAction::RestampLocal);
+        assert_eq!(prefixed("scratch", "pm: LLMs", None, None), LabelAction::RestampLocal);
         // user renamed locally, kept the prefix → push stripped name to remote
-        assert_eq!(
-            resolve_label(Some("pm"), "scratch", "pm: LLMs", Some("scratch")),
-            LabelAction::PushRemote("LLMs".into())
-        );
+        assert_eq!(prefixed("scratch", "pm: LLMs", Some("scratch"), None), LabelAction::PushRemote("LLMs".into()));
         // user renamed locally without prefix → push as-is
         assert_eq!(
-            resolve_label(Some("pm"), "scratch", "LLM runs", Some("scratch")),
+            prefixed("scratch", "LLM runs", Some("scratch"), Some("pm: scratch")),
             LabelAction::PushRemote("LLM runs".into())
         );
         // degenerate: renamed to just the prefix-colon or whitespace → restamp
-        assert_eq!(resolve_label(Some("pm"), "scratch", "pm:  ", Some("scratch")), LabelAction::RestampLocal);
+        assert_eq!(prefixed("scratch", "pm:  ", Some("scratch"), None), LabelAction::RestampLocal);
+    }
+
+    /// A prefix change leaves every mirror carrying the old stamp. That is the
+    /// daemon's own label, not a rename: pushing it would write "old: scratch"
+    /// onto the remote, and the next stamp would read "pm: old: scratch".
+    #[test]
+    fn a_changed_prefix_restamps_and_never_pushes_the_old_stamp() {
+        // stamped by this build: the label is its last stamp
+        assert_eq!(prefixed("scratch", "old: scratch", Some("scratch"), Some("old: scratch")), LabelAction::RestampLocal);
+        // stamped by an older build, no record: still a stamp in form
+        assert_eq!(prefixed("scratch", "old: scratch", Some("scratch"), None), LabelAction::RestampLocal);
+    }
+
+    #[test]
+    fn remote_style_pushes_a_rename_verbatim() {
+        assert_eq!(bare("🟩 vm-3", "🟩 vm-3", Some("🟩 vm-3"), Some("🟩 vm-3")), LabelAction::InSync);
+        // remote renamed → remote wins
+        assert_eq!(bare("🟩 vm-4", "🟩 vm-3", Some("🟩 vm-3"), Some("🟩 vm-3")), LabelAction::RestampLocal);
+        // user renamed the mirror → the remote gets exactly that, nothing stripped
+        assert_eq!(
+            bare("🟩 vm-3", "review: PR 12", Some("🟩 vm-3"), Some("🟩 vm-3")),
+            LabelAction::PushRemote("review: PR 12".into())
+        );
+        assert_eq!(bare("🟩 vm-3", "  ", Some("🟩 vm-3"), Some("🟩 vm-3")), LabelAction::RestampLocal);
+    }
+
+    /// Switching a host from `prefixed` to `remote` finds every mirror still
+    /// carrying "<prefix>: <remote>". None of those may reach the remote.
+    #[test]
+    fn switching_to_remote_style_restamps_every_prefixed_label() {
+        // stamped by this build in the old style
+        assert_eq!(bare("🟩 vm-3", "pm: 🟩 vm-3", Some("🟩 vm-3"), Some("pm: 🟩 vm-3")), LabelAction::RestampLocal);
+        // stamped by an older build: no record of the stamp
+        assert_eq!(bare("🟩 vm-3", "pm: 🟩 vm-3", Some("🟩 vm-3"), None), LabelAction::RestampLocal);
+        // a stamp under another prefix (the prefix changed too)
+        assert_eq!(bare("🟩 vm-3", "old·x: 🟩 vm-3", Some("🟩 vm-3"), Some("🟩 vm-3")), LabelAction::RestampLocal);
+        // a doubled label someone left behind
+        assert_eq!(bare("🟩 vm-3", "pm: pm: other", Some("🟩 vm-3"), Some("🟩 vm-3")), LabelAction::RestampLocal);
+        // and with no record of a stamp, even a plain name is not trusted
+        assert_eq!(bare("🟩 vm-3", "mine", Some("🟩 vm-3"), None), LabelAction::RestampLocal);
+    }
+
+    fn rws(label: &str, checkout: Option<&str>) -> WsInfo {
+        WsInfo {
+            workspace_id: "w1".into(),
+            label: label.into(),
+            tab_count: None,
+            pane_count: None,
+            active_tab_id: None,
+            tokens: HashMap::new(),
+            worktree: checkout.map(|c| WsWorktree {
+                checkout_path: Some(c.into()),
+                repo_name: Some("brightlights".into()),
+            }),
+        }
+    }
+
+    fn rpane(cwd: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: "w1:p1".into(),
+            tab_id: "w1:t1".into(),
+            workspace_id: "w1".into(),
+            label: None,
+            cwd: Some(cwd.into()),
+            foreground_cwd: Some(cwd.into()),
+        }
+    }
+
+    #[test]
+    fn ws_label_by_style() {
+        let mut host = ssh_host();
+        host.prefix = "dev-vm-david·brightlights3".into();
+        let sandbox = rws("🟩 david-vm-3", Some("/app"));
+        assert_eq!(ws_label(&host, &sandbox, &[]), "dev-vm-david·brightlights3: 🟩 david-vm-3");
+        host.label = LabelStyle::Remote;
+        assert_eq!(ws_label(&host, &sandbox, &[]), "🟩 david-vm-3");
+        // a remote label with nothing to compare is shown as it is
+        assert_eq!(ws_label(&host, &rws("notes", None), &[]), "notes");
+        // still herdr's default name for its checkout → the host's prefix
+        assert_eq!(ws_label(&host, &rws("app", Some("/app")), &[]), "dev-vm-david·brightlights3");
+        assert_eq!(ws_label(&host, &rws("", None), &[]), "dev-vm-david·brightlights3");
+    }
+
+    /// A host's own herdr names its workspace after the checkout, which would
+    /// read as a second local `brightlights`: the host's prefix shows instead,
+    /// and a name someone gave it shows as it is.
+    #[test]
+    fn a_host_mirror_with_the_default_name_shows_the_host() {
+        let mut host = ssh_host();
+        host.prefix = "dev-vm-david".into();
+        host.label = LabelStyle::Remote;
+        assert_eq!(ws_label(&host, &rws("brightlights", Some("/home/david/brightlights")), &[]), "dev-vm-david");
+        // herdr often reports no worktree; the panes' directories still tell
+        let p1 = rpane("/home/david/workspace/brightlights");
+        let p2 = rpane("/home/david/workspace/brightlights2");
+        assert_eq!(ws_label(&host, &rws("brightlights", None), &[&p1, &p2]), "dev-vm-david");
+        assert_eq!(ws_label(&host, &rws("brightlights2", None), &[&p1, &p2]), "dev-vm-david");
+        assert_eq!(ws_label(&host, &rws("migration", None), &[&p1, &p2]), "migration");
+        // a sandbox workspace someone named keeps its name; a fresh one ("app"
+        // after /app) shows the host instead
+        let app = rpane("/app");
+        assert_eq!(ws_label(&host, &rws("fa", None), &[&app]), "fa");
+        assert_eq!(ws_label(&host, &rws("app", None), &[&app]), "dev-vm-david");
     }
 
     /// Tabs carry the remote label verbatim, so the same resolution runs with no
@@ -2022,24 +2274,20 @@ mod tests {
     #[test]
     fn tab_label_two_way_rename() {
         // in sync → nothing
-        assert_eq!(resolve_label(None, "logs", "logs", Some("logs")), LabelAction::InSync);
+        assert_eq!(tab("logs", "logs", Some("logs")), LabelAction::InSync);
         // remote renamed since we last stamped → remote wins
-        assert_eq!(resolve_label(None, "build", "logs", Some("logs")), LabelAction::RestampLocal);
+        assert_eq!(tab("build", "logs", Some("logs")), LabelAction::RestampLocal);
         // user renamed the mirror tab, remote unchanged → push it to the remote
-        assert_eq!(
-            resolve_label(None, "logs", "deploys", Some("logs")),
-            LabelAction::PushRemote("deploys".into())
-        );
+        assert_eq!(tab("logs", "deploys", Some("logs")), LabelAction::PushRemote("deploys".into()));
         // no history (tab mapped by an older mirror) → remote wins once
-        assert_eq!(resolve_label(None, "logs", "deploys", None), LabelAction::RestampLocal);
+        assert_eq!(tab("logs", "deploys", None), LabelAction::RestampLocal);
         // renamed to whitespace → restamp rather than push an empty label
-        assert_eq!(resolve_label(None, "logs", "   ", Some("logs")), LabelAction::RestampLocal);
+        assert_eq!(tab("logs", "   ", Some("logs")), LabelAction::RestampLocal);
         // a never-named remote tab reports its position as its label, so a local
         // rename of one still has to push rather than restamp
-        assert_eq!(
-            resolve_label(None, "2", "notes", Some("2")),
-            LabelAction::PushRemote("notes".into())
-        );
+        assert_eq!(tab("2", "notes", Some("2")), LabelAction::PushRemote("notes".into()));
+        // a tab named like a workspace stamp is still just a tab name
+        assert_eq!(tab("logs", "ci: logs", Some("logs")), LabelAction::PushRemote("ci: logs".into()));
     }
 
     /// The `pane_agent_status_changed` event (herdr app/api.rs) must deserialize
@@ -2167,12 +2415,73 @@ mod tests {
         assert_eq!(order, vec!["L1", "W1", "W2", "V1"]); // W2 rises above V1
     }
 
+    fn group(owned: &[&str], prefix: Option<&str>) -> HostGroup {
+        HostGroup { owned: owned.iter().map(|s| s.to_string()).collect(), prefix: prefix.map(str::to_string) }
+    }
+
     #[test]
     fn ws_rank_classifies_by_prefix() {
-        let prefixes = vec!["work".to_string(), "vps".to_string()];
-        assert_eq!(ws_rank("work: slice", &prefixes), 1);
-        assert_eq!(ws_rank("vps: ~", &prefixes), 2);
-        assert_eq!(ws_rank("utopia", &prefixes), 0); // local
+        let groups = vec![group(&[], Some("work")), group(&[], Some("vps"))];
+        assert_eq!(ws_rank("w1", "work: slice", &groups), 1);
+        assert_eq!(ws_rank("w2", "vps: ~", &groups), 2);
+        assert_eq!(ws_rank("w3", "utopia", &groups), 0); // local
+    }
+
+    /// Under `label = "remote"` labels carry no host, and two hosts may show
+    /// the same one: only the maps can group them, and a local workspace of
+    /// the same name stays local.
+    #[test]
+    fn ws_rank_groups_remote_labels_by_map() {
+        let groups = vec![group(&["w5"], None), group(&["w7", "w8"], None)];
+        assert_eq!(ws_rank("w5", "🟩 vm-3", &groups), 1);
+        assert_eq!(ws_rank("w7", "🟩 vm-3", &groups), 2); // same label, other host
+        assert_eq!(ws_rank("w8", "dev-vm", &groups), 2);
+        assert_eq!(ws_rank("w1", "🟩 vm-3", &groups), 0); // a local workspace named alike
+        // the map wins over a label that happens to look like another host's stamp
+        let mixed = vec![group(&[], Some("work")), group(&["w9"], None)];
+        assert_eq!(ws_rank("w9", "work: notes", &mixed), 2);
+    }
+
+    #[test]
+    fn host_groups_read_each_hosts_map_and_skip_tombstones() {
+        let dir = std::env::temp_dir().join(format!("hm-groups-{}", std::process::id()));
+        let mut a = HostState::default();
+        a.workspaces.insert("R1".into(), ws_entry("w5", false));
+        a.workspaces.insert("R2".into(), ws_entry("w6", true));
+        save_state(&dir, "a", &a).unwrap();
+        let mut b_host = ssh_host();
+        b_host.name = "b".into();
+        b_host.label = LabelStyle::Remote;
+        let mut a_host = ssh_host();
+        a_host.name = "a".into();
+        let groups = host_groups(&dir, &[a_host, b_host]);
+        assert_eq!(groups[0].owned, ["w5".to_string()].into_iter().collect());
+        assert_eq!(groups[0].prefix.as_deref(), Some("vps"));
+        assert!(groups[1].owned.is_empty());
+        assert_eq!(groups[1].prefix, None, "a remote-style host has no label prefix to match");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_workspace_of_mirror_panes_is_a_placeholder() {
+        let pane = |ws: &str, cwd: &str| PaneInfo {
+            pane_id: format!("{ws}:p1"),
+            tab_id: format!("{ws}:t1"),
+            workspace_id: ws.into(),
+            label: None,
+            cwd: Some(cwd.into()),
+            foreground_cwd: None,
+        };
+        let panes = vec![
+            pane("w1", "/state/.mirror-pane"),
+            pane("w2", "/Users/me/brightlights"),
+            pane("w3", "/state/.mirror-pane"),
+            pane("w3", "/Users/me"),
+        ];
+        assert!(is_placeholder_workspace(&panes, "w1"));
+        assert!(!is_placeholder_workspace(&panes, "w2"), "a workspace someone opened");
+        assert!(!is_placeholder_workspace(&panes, "w3"), "one native pane is enough to refuse");
+        assert!(!is_placeholder_workspace(&panes, "w4"), "no panes, no evidence");
     }
 
     /// An agent-exit event carries no agent + "unknown" status → has_agent()
