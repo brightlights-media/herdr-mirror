@@ -3,9 +3,9 @@
 > **Brightlights fork.** This is [brightlights-media/herdr-mirror](https://github.com/brightlights-media/herdr-mirror),
 > a fork of [nikok6/herdr-mirror](https://github.com/nikok6/herdr-mirror) that carries fixes not yet
 > upstream. The `brightlights` branch is upstream `main` with each fix merged in, and its releases are
-> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.6` and so on), so `herdr plugin list` tells it
+> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.7` and so on), so `herdr plugin list` tells it
 > apart from upstream. Install it with
-> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.6`.
+> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.7`.
 > Each fix lives on its own branch, one commit off upstream `main` (`fix/short-escape-window` sits
 > on `fix/lone-escape-held-until-next-key`, and `fix/placeholder-gate-transient-process-info` on
 > `fix/streamer-launch-never-types-into-live-pane`), ready to offer upstream:
@@ -39,6 +39,10 @@
 > - [`perf/shorter-structural-debounce`](https://github.com/brightlights-media/herdr-mirror/tree/perf/shorter-structural-debounce):
 >   the daemon converges 50 ms after a structural remote event instead of 500 ms, so a remote split
 >   is mirrored about half a second sooner; a split's events still reconcile in one converge.
+> - [`feat/mirror-label-remote`](https://github.com/brightlights-media/herdr-mirror/tree/feat/mirror-label-remote):
+>   `label = "remote"` shows a mirror workspace under its remote label alone (the host's prefix
+>   while it still has herdr's default name); grouping, remote-create focus and orphan adoption go
+>   by the id maps, and a label the daemon stamped is never pushed to the remote as a rename.
 
 A [herdr](https://herdr.dev) plugin that mirrors a remote herdr server's
 workspaces and agents into your local sidebar. One window shows the agents on
