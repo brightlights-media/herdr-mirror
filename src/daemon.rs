@@ -634,7 +634,6 @@ async fn heal_zombie_mirrors(
 async fn local_events_task(
     local: ApiClient,
     pokers: Vec<mpsc::Sender<()>>,
-    prefixes: Vec<String>,
     hosts: Vec<HostConfig>,
     state_dir: PathBuf,
     log: Logger,
@@ -661,7 +660,7 @@ async fn local_events_task(
         match local.subscribe(subs).await {
             Ok(mut stream) => {
                 // catch a sidebar left ungrouped from a previous run
-                regroup_sidebar(&local, &prefixes, &log).await;
+                regroup_sidebar(&local, &hosts, &state_dir, &log).await;
                 // subscribe succeeding after a drop = the server is back up;
                 // give session-restore a beat, then sweep for zombie mirrors
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -687,7 +686,7 @@ async fn local_events_task(
                         let _ = p.try_send(());
                     }
                     // a workspace appeared/left — keep hosts grouped (no-op if already)
-                    regroup_sidebar(&local, &prefixes, &log).await;
+                    regroup_sidebar(&local, &hosts, &state_dir, &log).await;
                 }
                 log.log("local event stream dropped — resubscribing");
             }
@@ -757,11 +756,9 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
-    let prefixes: Vec<String> = config.hosts.iter().map(|h| h.prefix.clone()).collect();
     tasks.push(tokio::spawn(local_events_task(
         local.clone(),
         pokers.clone(),
-        prefixes,
         config.hosts.clone(),
         env.state_dir.clone(),
         log.clone(),

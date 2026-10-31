@@ -627,55 +627,28 @@ async fn create_remote(env: &Env, host: HostConfig) -> Result<()> {
     let mut remote = RemoteHost::new(&host, &env.state_dir);
     let (api, _status) = remote.connect_api().await?;
 
-    // ids of the mirror workspaces that exist NOW, so the one the daemon is
-    // about to build for our create is recognizable as the new arrival
     let local = ApiClient::connect(&env.local_socket).await?;
-    let known = local_workspace_ids(&local).await.unwrap_or_default();
 
     let res: Value = api.request("workspace.create", json!({ "focus": false })).await?;
-    println!(
-        "created workspace {} on {} - waiting for its mirror...",
-        res.pointer("/workspace/workspace_id").and_then(Value::as_str).unwrap_or("?"),
-        host.name
-    );
+    let remote_ws = res.pointer("/workspace/workspace_id").and_then(Value::as_str).unwrap_or("?").to_string();
+    println!("created workspace {remote_ws} on {} - waiting for its mirror...", host.name);
 
     // Follow through: a local create lands you in the new workspace, so a
-    // remote one should too. Poll for the mirror the daemon builds (labels are
-    // "<host>: <label>") and focus it. Best-effort — a slow mirror just means
-    // the message below and the workspace appearing on its own.
-    let prefix = format!("{}: ", host.name);
+    // remote one should too. Poll the host's id map for the mirror the daemon
+    // builds and focus it: the map, not the label, says which local workspace
+    // mirrors it (a label need not name the host). Best-effort — a slow mirror
+    // just means the message below and the workspace appearing on its own.
     for _ in 0..16 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let Ok(ws) = local.request("workspace.list", json!({})).await else { continue };
-        let Some(arr) = ws.get("workspaces").and_then(Value::as_array) else { continue };
-        let fresh = arr.iter().find(|w| {
-            let id = w.get("workspace_id").and_then(Value::as_str).unwrap_or("");
-            let label = w.get("label").and_then(Value::as_str).unwrap_or("");
-            !known.contains(id) && label.starts_with(&prefix)
-        });
-        if let Some(w) = fresh {
-            let id = w.get("workspace_id").and_then(Value::as_str).unwrap_or("");
-            let _ = local.request("workspace.focus", json!({ "workspace_id": id })).await;
-            println!("opened {}", w.get("label").and_then(Value::as_str).unwrap_or(id));
+        let state = crate::state::load_state(&env.state_dir, &host.name);
+        let Some(entry) = state.workspaces.get(&remote_ws).filter(|e| !e.is_tombstoned()) else { continue };
+        if local.request("workspace.focus", json!({ "workspace_id": entry.local_id })).await.is_ok() {
+            println!("opened {}", entry.local_id);
             return Ok(());
         }
     }
     println!("mirror is taking longer than usual; it will appear on its own");
     Ok(())
-}
-
-async fn local_workspace_ids(api: &ApiClient) -> Result<std::collections::HashSet<String>> {
-    let ws: Value = api.request("workspace.list", json!({})).await?;
-    Ok(ws
-        .get("workspaces")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|w| w.get("workspace_id").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default())
 }
 
 // --- adding a machine from ~/.ssh/config -----------------------------------

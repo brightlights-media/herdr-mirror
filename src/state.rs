@@ -48,6 +48,11 @@ pub struct WsEntry {
     /// (push the rename to the remote instead of stomping it)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_remote_label: Option<String>,
+    /// local label the daemon last stamped. A local label still equal to it is
+    /// our own stamp, never a user rename, so a change of label form (prefix,
+    /// `label` style) restamps instead of pushing the old form to the remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_local_label: Option<String>,
 }
 
 impl WsEntry {
@@ -268,6 +273,18 @@ pub fn focus_step(
     }
 }
 
+/// Local workspace ids that any host's map holds, tombstoned or not: a mirror
+/// workspace belongs to the host whose map has it, whatever its label says.
+pub fn mapped_local_workspaces(state_dir: &Path) -> std::collections::HashSet<String> {
+    let Ok(dir) = std::fs::read_dir(state_dir) else {
+        return Default::default();
+    };
+    dir.filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|n| n.strip_suffix("-map.json").map(str::to_string))
+        .flat_map(|h| load_state(state_dir, &h).workspaces.into_values().map(|e| e.local_id))
+        .collect()
+}
+
 pub fn load_state(state_dir: &Path, host: &str) -> HostState {
     std::fs::read_to_string(state_path(state_dir, host))
         .ok()
@@ -317,6 +334,30 @@ mod tests {
         assert!(out.contains("rootTabLocalId"));
         // absent options stay absent
         assert!(!out.contains("\"reported\":null"));
+    }
+
+    #[test]
+    fn mapped_local_workspaces_spans_every_hosts_map() {
+        let dir = std::env::temp_dir().join(format!("hm-mapped-{}", std::process::id()));
+        let entry = |local: &str| WsEntry {
+            local_id: local.into(),
+            tombstone: None,
+            root_tab_local_id: None,
+            last_remote_label: None,
+            last_local_label: Some("🟩 vm-3".into()),
+        };
+        let mut a = HostState::default();
+        a.workspaces.insert("w1".into(), entry("w5"));
+        let mut b = HostState::default();
+        b.workspaces.insert("w1".into(), entry("w7")); // same remote id, other host
+        save_state(&dir, "a", &a).unwrap();
+        save_state(&dir, "b", &b).unwrap();
+        let mapped = mapped_local_workspaces(&dir);
+        assert_eq!(mapped, ["w5".to_string(), "w7".to_string()].into_iter().collect());
+        // and the stamp record round-trips under its camelCase name
+        let text = std::fs::read_to_string(state_path(&dir, "a")).unwrap();
+        assert!(text.contains("\"lastLocalLabel\": \"🟩 vm-3\""));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -380,6 +421,7 @@ mod tests {
             tombstone: tomb,
             root_tab_local_id: None,
             last_remote_label: None,
+            last_local_label: None,
         };
         let with = |entries: Vec<(&str, WsEntry)>| HostState {
             workspaces: entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),

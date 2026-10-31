@@ -87,6 +87,30 @@ impl ApiTransport {
     }
 }
 
+/// What a mirror workspace's local label shows.
+///
+/// `Prefixed` (the default) is `<prefix>: <remote label>`. `Remote` is the
+/// remote label alone, except that a remote workspace still carrying herdr's
+/// default name (the name of a directory one of its panes is in) shows the host's `prefix`
+/// instead: a remote `brightlights` would otherwise read as a second local
+/// `brightlights`. Either way the daemon tells mirrors apart by its id map,
+/// never by label, so two hosts may show the same label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelStyle {
+    Prefixed,
+    Remote,
+}
+
+impl LabelStyle {
+    fn parse(s: &str) -> Option<LabelStyle> {
+        match s {
+            "prefixed" => Some(LabelStyle::Prefixed),
+            "remote" => Some(LabelStyle::Remote),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     pub name: String,
@@ -96,6 +120,8 @@ pub struct HostConfig {
     pub kind: HostKind,
     pub docker_bin: String,
     pub prefix: String,
+    /// see `LabelStyle`. Default `Prefixed`.
+    pub label: LabelStyle,
     /// Remote herdr binary. `None` = auto-resolve on the remote: PATH first
     /// (`command -v herdr`), then `~/.local/bin/herdr`. See `remote_herdr_expr`.
     pub remote_bin: Option<String>,
@@ -158,6 +184,7 @@ struct RawConfig {
     default_host: Option<String>,
     close_remote_on_local_close: Option<bool>,
     always_control: Option<bool>,
+    label: Option<String>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
     // toml::Table (preserve_order) keeps declaration order — the first host
@@ -179,6 +206,7 @@ struct RawHost {
     session: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
+    label: Option<String>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
     api_transport: Option<String>,
@@ -272,6 +300,13 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             warnings.push(format!("{key} = 0 ignored: 0 means unset, not \"cap to nothing\""));
         }
     }
+    let global_label = match raw.label.as_deref() {
+        None => LabelStyle::Prefixed,
+        Some(s) => LabelStyle::parse(s).unwrap_or_else(|| {
+            warnings.push(format!("label = \"{s}\" ignored (expected prefixed or remote)"));
+            LabelStyle::Prefixed
+        }),
+    };
     let global_max_cols = size_cap(raw.max_cols);
     let global_max_rows = size_cap(raw.max_rows);
     let mut hosts: Vec<HostConfig> = Vec::new();
@@ -312,8 +347,22 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
                 }
             },
         };
+        let label = match h.label.as_deref() {
+            None => global_label,
+            Some(s) => match LabelStyle::parse(s) {
+                Some(l) => l,
+                None => {
+                    warnings.push(format!(
+                        "skipping host: [hosts.{name}]: unknown label \"{s}\" \
+                         (expected prefixed or remote)"
+                    ));
+                    continue;
+                }
+            },
+        };
         hosts.push(HostConfig {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
+            label,
             // empty string is treated as unset (auto PATH → ~/.local/bin/herdr)
             remote_bin: h.remote_bin.filter(|s| !s.is_empty()),
             session: h.session.filter(|s| !s.is_empty()),
@@ -373,6 +422,34 @@ mod tests {
         assert_eq!(h.remote_bin, None); // auto: PATH then ~/.local/bin/herdr
         assert_eq!(h.session, None); // default remote session
         assert!(h.always_control); // default on
+    }
+
+    #[test]
+    fn label_style_global_default_and_per_host_override() {
+        let c = parse_config(
+            "label = \"remote\"\n\
+             [hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\nlabel = \"prefixed\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.hosts[0].label, LabelStyle::Remote); // inherits global
+        assert_eq!(c.hosts[1].label, LabelStyle::Prefixed); // per-host override
+        let d = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert_eq!(d.hosts[0].label, LabelStyle::Prefixed, "upstream form stays the default");
+    }
+
+    #[test]
+    fn unknown_label_skips_the_host_or_warns_globally() {
+        let c = parse_config(
+            "[hosts.a]\ntarget = \"a\"\nlabel = \"bare\"\n[hosts.b]\ntarget = \"b\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.hosts.len(), 1);
+        assert_eq!(c.hosts[0].name, "b");
+        assert!(c.warnings.iter().any(|w| w.contains("unknown label \"bare\"")));
+        let g = parse_config("label = \"bare\"\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert_eq!(g.hosts[0].label, LabelStyle::Prefixed);
+        assert!(g.warnings.iter().any(|w| w.contains("label = \"bare\" ignored")));
     }
 
     #[test]

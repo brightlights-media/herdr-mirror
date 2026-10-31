@@ -653,6 +653,7 @@ mod tests {
             kind: crate::config::HostKind::Ssh,
             docker_bin: "docker".into(),
             prefix: name.into(),
+            label: crate::config::LabelStyle::Prefixed,
             remote_bin: None,
             session: None,
             max_cols: None,
