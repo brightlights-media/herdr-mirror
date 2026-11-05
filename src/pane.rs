@@ -247,7 +247,29 @@ fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
     argv
 }
 
-fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
+/// The remote command for one stream. `takeover` asks herdr to displace a
+/// client already controlling the terminal; without it herdr refuses control
+/// while another client holds it.
+fn session_command(bin: &str, mode: Mode, target: &str, takeover: bool, cols: usize, rows: usize) -> String {
+    format!(
+        "exec {} terminal session {} {}{} --cols {} --rows {}",
+        bin,
+        mode.as_str(),
+        sh_quote(target),
+        if takeover { " --takeover" } else { "" },
+        cols,
+        rows
+    )
+}
+
+fn spawn_session(
+    args: &Args,
+    mode: Mode,
+    takeover: bool,
+    (cols, rows): (usize, usize),
+    gen: u64,
+    tx: mpsc::Sender<Msg>,
+) -> Result<Session> {
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
     // config::remote_herdr_expr).
@@ -255,14 +277,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         args.remote_bin.as_deref(),
         args.session.as_deref(),
     );
-    let cmd = format!(
-        "exec {} terminal session {} {} --cols {} --rows {}",
-        bin,
-        mode.as_str(),
-        sh_quote(&args.pane_target),
-        cols,
-        rows
-    );
+    let cmd = session_command(&bin, mode, &args.pane_target, takeover, cols, rows);
     // ssh and docker differ only in how the command is carried; the streaming
     // contract (piped stdio, herdr's frames on stdout) is identical
     let mut builder = match &args.container {
@@ -747,6 +762,19 @@ fn target_gone(reason: &str, pane_target: &str) -> bool {
         .contains(&format!("terminal target {} not found", pane_target.to_ascii_lowercase()))
 }
 
+/// The note to show when a control session ended because another client has
+/// control: herdr closes a displaced controller with "terminal attach taken
+/// over", and refuses one while the terminal "already has an attached client".
+fn held_note(reason: &str) -> Option<&'static str> {
+    if reason.contains("attach taken over") {
+        Some("another client took control — type to take it back")
+    } else if reason.contains("already has an attached client") {
+        Some("another client has control — type to take over")
+    } else {
+        None
+    }
+}
+
 /// Delay before the next attempt, and the ladder position to keep.
 ///
 /// Pure so the rung and the ladder-resume are testable without a live pane.
@@ -779,6 +807,13 @@ struct App {
     /// consecutive quick control failures → fall back to observe
     control_failures: u32,
     control_sticky: bool,
+    /// the next control connect was asked for by the user (a keystroke), so it
+    /// takes the terminal from any other client. Automatic connects (startup,
+    /// resize, reconnect) never do, or two mirrors would steal it back and forth.
+    takeover_armed: bool,
+    /// why this pane is view-only when another client holds control; kept on
+    /// the status line, which every frame otherwise clears, until the user types
+    held_note: Option<&'static str>,
     pending_input: Vec<Vec<u8>>,
     last_input: Instant,
     hint_clear_at: Option<Instant>,
@@ -1010,8 +1045,10 @@ impl App {
         if let Some(s) = self.session.take() {
             kill_session_process_group(s.process_group);
         }
+        // only a control request the user made displaces another client
+        let takeover = m == Mode::Control && std::mem::take(&mut self.takeover_armed);
         self.next_gen += 1;
-        match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
+        match spawn_session(&self.args, m, takeover, (cols, rows), self.next_gen, self.tx.clone()) {
             Ok(mut s) => {
                 if m == Mode::Control {
                     self.last_input = Instant::now();
@@ -1068,6 +1105,33 @@ impl App {
     }
 
 
+    /// The user asked for control (typed, or wheeled after a refusal): take it,
+    /// from another client if one holds it. Armed before `switch_mode`, whose
+    /// already-switching guard returns early.
+    fn request_control(&mut self) {
+        self.held_note = None;
+        self.control_sticky = false;
+        self.takeover_armed = true;
+        self.switch_mode(Mode::Control);
+    }
+
+    /// Show why the pane is view-only for as long as it stays that way.
+    fn hold_note(&mut self, note: &'static str) {
+        self.held_note = Some(note);
+        self.hint_sticky(note);
+    }
+
+    /// Input arrived while a reconnect is pending: retry now. A control
+    /// reconnect the user is typing into takes over, like any keystroke.
+    fn retry_now_for_input(&mut self) {
+        if let Some((_, m)) = self.reconnect_at {
+            if m == Mode::Control {
+                self.takeover_armed = true;
+            }
+            self.reconnect_at = Some((Instant::now(), m));
+        }
+    }
+
     fn switch_mode(&mut self, m: Mode) {
         // already settled or scheduled — don't restart. Without this guard,
         // fast typing during the 200ms connect gap would spawn one control
@@ -1103,7 +1167,7 @@ impl App {
         }
         let Some(bytes) = &frame.bytes else { return };
         self.backoff_idx = 0;
-        self.renderer.status("");
+        self.renderer.status(self.held_note.unwrap_or(""));
         let (fw, fh) = (
             frame.width.unwrap_or(self.grid.width),
             frame.height.unwrap_or(self.grid.height),
@@ -1146,6 +1210,16 @@ impl App {
         self.session = None;
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
+        if let Some(note) = (exited_mode == Mode::Control).then(|| held_note(&reason_line)).flatten() {
+            // another client has control: watch, and leave it to them until
+            // someone types here. Retrying control on our own would either fail
+            // again or, with a takeover, start two mirrors fighting over the pane.
+            self.control_failures = 0;
+            self.control_sticky = true;
+            self.switch_mode(Mode::Observe);
+            self.hold_note(note);
+            return;
+        }
         // control that dies quickly twice is failing (refused/dropped): fall
         // back to observe so the pane stays viewable; a keystroke retries
         if exited_mode == Mode::Control {
@@ -1327,8 +1401,7 @@ impl App {
                 // while glancing shouldn't grab the remote's lock
                 if contains_wheel_press(&buf) {
                     if self.control_sticky {
-                        self.control_sticky = false;
-                        self.switch_mode(Mode::Control);
+                        self.request_control();
                     } else {
                         self.hint("read-only — type to take control");
                     }
@@ -1336,9 +1409,8 @@ impl App {
                 return;
             }
             // any keystroke takes control and is delivered once the session is up
-            self.control_sticky = false;
             self.pending_input.push(buf);
-            self.switch_mode(Mode::Control);
+            self.request_control();
             return;
         }
 
@@ -1357,9 +1429,7 @@ impl App {
             // spinning up or awaiting reconnect: queue the keystroke (flushed
             // on connect) and, if in backoff, reconnect now
             self.pending_input.push(buf);
-            if let Some((_, m)) = self.reconnect_at {
-                self.reconnect_at = Some((Instant::now(), m));
-            }
+            self.retry_now_for_input();
             return;
         }
         // refresh the foreground classification on any input while active.
@@ -1484,17 +1554,14 @@ impl App {
 
     async fn deliver_input(&mut self, buf: Vec<u8>) {
         if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
-            self.control_sticky = false;
             self.pending_input.push(buf);
-            self.switch_mode(Mode::Control);
+            self.request_control();
             return;
         }
         self.last_input = Instant::now();
         if self.switching_to == Some(Mode::Control) || self.session.is_none() {
             self.pending_input.push(buf);
-            if let Some((_, m)) = self.reconnect_at {
-                self.reconnect_at = Some((Instant::now(), m));
-            }
+            self.retry_now_for_input();
             return;
         }
         self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&buf) })).await;
@@ -1624,6 +1691,8 @@ pub async fn run(args: Args) -> Result<()> {
         reconnect_at: None,
         control_failures: 0,
         control_sticky: false,
+        takeover_armed: false,
+        held_note: None,
         pending_input: Vec::new(),
         last_input: Instant::now(),
         hint_clear_at: None,
@@ -1758,7 +1827,7 @@ pub async fn run(args: Args) -> Result<()> {
                 }
                 if app.hint_clear_at.is_some_and(|t| t <= now) {
                     app.hint_clear_at = None;
-                    app.renderer.status("");
+                    app.renderer.status(app.held_note.unwrap_or(""));
                     app.paint();
                 }
                 if idle_at.is_some_and(|t| t <= now) && app.mode == Mode::Control && app.switching_to.is_none() {
@@ -2331,6 +2400,62 @@ mod tests {
     }
 
 
+    /// An App in control whose session is a local `cat`. No SSH is used.
+    fn control_app() -> (App, tokio::process::Child) {
+        let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
+        let tty = true;
+        let (tx, _rx) = mpsc::channel(256);
+        let mut app = App {
+            args,
+            tty,
+            grid: Grid::new(),
+            renderer: Renderer::new(),
+            tx,
+            mode: Mode::Observe,
+            switching_to: None,
+            switch_at: None,
+            session: None,
+            next_gen: 0,
+            backoff_idx: 0,
+            reconnect_at: None,
+            control_failures: 0,
+            control_sticky: false,
+            takeover_armed: false,
+            held_note: None,
+            pending_input: Vec::new(),
+            last_input: Instant::now(),
+            hint_clear_at: None,
+            predict: Predictor::new(),
+            remote_fg: None,
+            select: Select::new(),
+            last_select_rows: None,
+            fg_poll_at: None,
+            settle_at: None,
+            mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
+            // startup leaves the pane in normal cursor mode; the first classification
+            // moves it if the remote turns out to be a TUI
+            app_cursor_keys: false,
+            paste_inflight: false,
+            paste_buf: Vec::new(),
+            mouse_buf: Vec::new(),
+            mouse_flush_at: None,
+            paste_queue: Vec::new(),
+            paste_original: None,
+        };
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
+            .spawn().unwrap();
+        app.session = Some(Session {
+            gen: 1, mode: Mode::Control, process_group: child.id().unwrap() as i32,
+            stdin: child.stdin.take().unwrap(),
+        });
+        app.mode = Mode::Control;
+        app.remote_fg = Some(Fg::Mouse);
+        // Keep foreground polling local to this fixture: suppress SSH probes.
+        app.fg_poll_at = Some(Instant::now());
+        (app, child)
+    }
+
     // Exercise the real input routing: a release and the next press can share
     // one stdin read. A local sink stands in for the session; no SSH is used.
     async fn selection_followed_by_press(next_drag: bool) {
@@ -2352,6 +2477,8 @@ mod tests {
             reconnect_at: None,
             control_failures: 0,
             control_sticky: false,
+            takeover_armed: false,
+            held_note: None,
             pending_input: Vec::new(),
             last_input: Instant::now(),
             hint_clear_at: None,
@@ -2399,6 +2526,82 @@ mod tests {
         } else {
             assert_eq!(result, Released::Click(b"\x1b[<0;1;2Mrelease".to_vec()));
         }
+    }
+
+    #[test]
+    fn only_an_armed_control_session_asks_to_take_over() {
+        let cmd = |mode, takeover| session_command("herdr", mode, "w1:p2", takeover, 80, 24);
+        assert_eq!(
+            cmd(Mode::Control, true),
+            "exec herdr terminal session control 'w1:p2' --takeover --cols 80 --rows 24"
+        );
+        assert!(!cmd(Mode::Control, false).contains("--takeover"));
+        assert!(!cmd(Mode::Observe, false).contains("--takeover"));
+    }
+
+    #[test]
+    fn held_note_names_herdrs_two_held_elsewhere_reasons() {
+        assert!(held_note("terminal attach taken over").unwrap().contains("took control"));
+        assert!(held_note(
+            "terminal attach failed: terminal term_1 already has an attached client; retry with --takeover"
+        )
+        .unwrap()
+        .contains("has control"));
+        assert_eq!(held_note("detached"), None);
+        assert_eq!(held_note("ssh: connect to host x port 22: Connection refused"), None);
+    }
+
+    /// Losing control to another client, or being refused it, leaves the pane
+    /// watching and never schedules a control reconnect: that reconnect is what
+    /// let two always-control mirrors take a pane back from each other.
+    #[tokio::test]
+    async fn another_client_holding_control_leaves_the_pane_watching() {
+        for reason in [
+            "terminal attach taken over",
+            "terminal attach failed: terminal t already has an attached client; retry with --takeover",
+        ] {
+            let (mut app, mut child) = control_app();
+            app.args.always_control = true;
+            app.handle_exit(1, Mode::Control, reason.into(), Duration::from_secs(60));
+            assert_eq!(app.switching_to, Some(Mode::Observe), "{reason}");
+            assert!(app.reconnect_at.is_none(), "{reason}");
+            assert!(app.control_sticky, "a resize must not retake it: {reason}");
+            assert!(app.held_note.is_some(), "{reason}");
+            assert!(!app.takeover_armed, "{reason}");
+            drop(app);
+            child.kill().await.unwrap();
+        }
+    }
+
+    /// Typing in a pane another client controls takes control from it.
+    #[tokio::test]
+    async fn a_keystroke_while_watching_takes_over() {
+        let (mut app, mut child) = control_app();
+        app.handle_exit(1, Mode::Control, "terminal attach taken over".into(), Duration::from_secs(60));
+        app.switching_to = None;
+        app.mode = Mode::Observe;
+        app.handle_stdin(b"x".to_vec()).await;
+        assert_eq!(app.switching_to, Some(Mode::Control));
+        assert!(app.takeover_armed);
+        assert!(!app.control_sticky);
+        assert!(app.held_note.is_none());
+        drop(app);
+        child.kill().await.unwrap();
+    }
+
+    /// A keystroke while a control reconnect waits makes that reconnect take
+    /// over; an unprompted reconnect does not.
+    #[tokio::test]
+    async fn typing_into_a_pending_control_reconnect_arms_takeover() {
+        let (mut app, mut child) = control_app();
+        app.session = None;
+        app.reconnect_at = Some((Instant::now() + Duration::from_secs(5), Mode::Control));
+        assert!(!app.takeover_armed);
+        app.handle_stdin(b"x".to_vec()).await;
+        assert!(app.takeover_armed);
+        assert!(app.reconnect_at.is_some_and(|(t, _)| t <= Instant::now()));
+        drop(app);
+        child.kill().await.unwrap();
     }
 
     #[tokio::test]
