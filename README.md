@@ -3,9 +3,9 @@
 > **Brightlights fork.** This is [brightlights-media/herdr-mirror](https://github.com/brightlights-media/herdr-mirror),
 > a fork of [nikok6/herdr-mirror](https://github.com/nikok6/herdr-mirror) that carries fixes not yet
 > upstream. The `brightlights` branch is upstream `main` with each fix merged in, and its releases are
-> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.7` and so on), so `herdr plugin list` tells it
+> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.8` and so on), so `herdr plugin list` tells it
 > apart from upstream. Install it with
-> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.7`.
+> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.8`.
 > Each fix lives on its own branch, one commit off upstream `main` (`fix/short-escape-window` sits
 > on `fix/lone-escape-held-until-next-key`, and `fix/placeholder-gate-transient-process-info` on
 > `fix/streamer-launch-never-types-into-live-pane`), ready to offer upstream:
@@ -43,6 +43,10 @@
 >   `label = "remote"` shows a mirror workspace under its remote label alone (the host's prefix
 >   while it still has herdr's default name); grouping, remote-create focus and orphan adoption go
 >   by the id maps, and a label the daemon stamped is never pushed to the remote as a rename.
+> - [`fix/keystroke-takes-over-control`](https://github.com/brightlights-media/herdr-mirror/tree/fix/keystroke-takes-over-control):
+>   typing in a mirror pane takes control even while another client holds it (`--takeover`), and a
+>   mirror that loses control, or is refused it, watches until someone types there instead of
+>   taking it back, so two mirrors of one pane no longer fight over it or lock each other out.
 
 A [herdr](https://herdr.dev) plugin that mirrors a remote herdr server's
 workspaces and agents into your local sidebar. One window shows the agents on
