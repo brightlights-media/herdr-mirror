@@ -385,7 +385,8 @@ target = "work"
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
 # group = "vps"                      # with group_by_host, show this host's
-                                     # mirrors under that host's header
+                                     # mirrors under that host's header,
+                                     # also while that host is absent
 # api_transport = "auto"             # how to reach the remote API socket:
                                      # "socket" = ssh -L forward, "exec" = relay
                                      # over ssh exec (needs socat or python3).
@@ -424,27 +425,38 @@ always wins over an older local one.
 With `group_by_host = true` each host's mirror workspaces sit under one
 collapsible header in the sidebar, named by the host's `prefix`, instead of
 side by side with your local workspaces. A host with `group = "<other host>"`
-joins that host's header instead of getting its own (one level: the named host
-must not itself name a group, else the host keeps its own header and the log
-says why). It needs `git` on this machine and a local herdr with the worktree
-API (`herdr worktree open`).
+joins that host's header instead of getting its own. The group keeps that name
+while the other host is absent (not in the config, or disabled), under a header
+labelled with the name itself, so a host's mirrors do not move each time the
+other host comes and goes. One level only: a `group` naming a host that itself
+names a group is ignored, and the log says why. It needs `git` on this machine
+and a local herdr with the worktree API (`herdr worktree open`).
 
 herdr nests a workspace only under the main checkout of a git repo it is a
 linked worktree of, so the daemon keeps a small stand-in repo per group in
-`~/.cache/herdr-mirror/groups/<host>/` (`main/`, one empty commit on a branch
+`~/.cache/herdr-mirror/groups/<group>/` (`main/`, one empty commit on a branch
 named `mirror`) and opens each mirror workspace on a worktree of it
-(`wt/<host>--<remote workspace id>`). The header is a workspace on `main/`
-with a plain shell; the worktrees only give each mirror a place to belong, and
-the mirror panes stream the remote as always.
+(`wt/<host>+<remote workspace id>`; names keep `[a-z0-9-]`, and every other
+byte is written `_` and two hex digits, so no two names share a path). The
+worktrees only give each mirror a place to belong, and the mirror panes stream
+the remote as always. The header is a workspace on `main/` whose one pane runs
+`herdr-mirror group-header`, which says what the header is and ignores what you
+type there.
 
 The header comes and goes with its mirrors: it is made when the group's first
 mirror is, and closed when the last one goes (the remote closed it, you closed
-it, `hide`, `teardown`). Each worktree is removed with its mirror. Turning
-`group_by_host` on or off, or changing a host's `group`, moves the existing
-mirrors on the next sync by closing them and opening them again in the right
-place: nothing on the remote changes, and the new panes stream the same remote
-panes. Local workspaces are never touched. Closing a header yourself closes
-the group; with `close_remote_on_local_close = true` that closes each mirror's
+it, `hide`, `teardown`), but only while its one pane still runs
+`group-header`. A header you split, added a tab to, or got a shell in is kept,
+and the log says so once. Each worktree is removed with its mirror.
+
+Turning `group_by_host` on or off, or changing a host's `group`, moves the
+existing mirrors on the next sync by closing them and opening them again in the
+right place: nothing on the remote changes, and the new panes stream the same
+remote panes. A mirror workspace holding a pane that is not one of its mirror
+panes (a shell split into it, a tab opened there) is not moved, since closing it
+would close that pane too; the log names it once, and it moves once that pane is
+gone. Local workspaces are never touched. Closing a header yourself closes the
+group; with `close_remote_on_local_close = true` that closes each mirror's
 remote workspace too, as closing the mirrors one by one would.
 
 ## Devcontainer

@@ -10,7 +10,12 @@
 //
 // The filesystem path is the identity: the header is the workspace whose
 // checkout is `<root>/<group>/main`, and the mirror of remote workspace `rid`
-// from `host` is the one whose checkout is `<root>/<group>/wt/<host>--<rid>`.
+// from `host` is the one whose checkout is `<root>/<group>/wt/<host>+<rid>`
+// (each name encoded by `path_component`, so no two names share a path).
+//
+// The header's one pane runs `herdr-mirror group-header`, which shows what the
+// header is and ignores what is typed there. A header still running it is one
+// nobody used, and only such a header is closed when its last mirror goes.
 // Adopting what a crash or a restart left behind is a snapshot lookup, never a
 // guess from a label.
 
@@ -24,7 +29,7 @@ use crate::api::ApiClient;
 use crate::config::MirrorConfig;
 use crate::mirror::WsInfo;
 use crate::state::load_state;
-use crate::util::{err, home_dir, sane_component, Logger, Result};
+use crate::util::{err, home_dir, Logger, Result};
 
 pub struct Grouping {
     pub enabled: bool,
@@ -37,6 +42,8 @@ pub struct Grouping {
     /// both may find it missing. Also keeps `tidy` from closing a header
     /// between its creation and its first child opening.
     lock: tokio::sync::Mutex<()>,
+    /// things logged once per daemon rather than on every pass
+    noticed: std::sync::Mutex<HashSet<String>>,
 }
 
 /// What `worktree.open` answered.
@@ -72,6 +79,7 @@ impl Grouping {
                 .map(|h| (h.group.clone(), prefix_of.get(h.group.as_str()).unwrap_or(&h.group.as_str()).to_string()))
                 .collect(),
             lock: tokio::sync::Mutex::new(()),
+            noticed: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -83,8 +91,14 @@ impl Grouping {
         g
     }
 
+    /// True the first time `key` is asked about: for a log line that would
+    /// otherwise repeat on every pass.
+    pub fn first_notice(&self, key: &str) -> bool {
+        self.noticed.lock().map_or(true, |mut n| n.insert(key.to_string()))
+    }
+
     fn group_dir(&self, group: &str) -> PathBuf {
-        self.root.join(sane_component(group))
+        self.root.join(path_component(group))
     }
 
     pub fn main_dir(&self, group: &str) -> PathBuf {
@@ -94,7 +108,7 @@ impl Grouping {
     fn child_dir_in(&self, group: &str, host: &str, rid: &str) -> PathBuf {
         self.group_dir(group)
             .join("wt")
-            .join(format!("{}--{}", sane_component(host), sane_component(rid)))
+            .join(format!("{}+{}", path_component(host), path_component(rid)))
     }
 
     /// Where the mirror of `host`'s remote workspace `rid` belongs: its
@@ -185,17 +199,28 @@ impl Grouping {
         #[derive(Deserialize)]
         struct Created {
             workspace: CreatedWs,
+            root_pane: CreatedPane,
         }
         #[derive(Deserialize)]
         struct CreatedWs {
             workspace_id: String,
         }
+        #[derive(Deserialize)]
+        struct CreatedPane {
+            pane_id: String,
+        }
         let created: Created = local
             .request_t(
                 "workspace.create",
-                json!({ "label": label, "cwd": main.display().to_string(), "focus": false }),
+                json!({
+                    "label": label,
+                    "cwd": main.display().to_string(),
+                    "focus": false,
+                    "env": { "SHELL": "/bin/sh" },
+                }),
             )
             .await?;
+        start_header_pane(local, &created.root_pane.pane_id, &label, log);
         Ok(created.workspace.workspace_id)
     }
 
@@ -228,6 +253,15 @@ impl Grouping {
             .collect();
         let plan = plan_tidy(&self.root, &list, &protected, &existing_children(&self.root));
         for ws in plan.close_headers {
+            let Some(header) = list.iter().find(|w| w.workspace_id == ws) else { continue };
+            if !header_untouched(local, header).await {
+                if self.first_notice(&format!("kept header {ws}")) {
+                    log.log(&format!(
+                        "keeping group header {ws} with no mirror left under it: someone used it"
+                    ));
+                }
+                continue;
+            }
             log.log(&format!("closing group header {ws}: no mirror is left under it"));
             // never close_group: a mirror that appeared since makes herdr
             // refuse, which is the answer we want
@@ -259,6 +293,110 @@ impl Grouping {
                         .await;
                 }
             }
+        }
+    }
+}
+
+/// A name as one path component that no other name maps to: `[a-z0-9-]` as
+/// is, every other byte (uppercase too, for case-insensitive filesystems) as
+/// `_` and two hex digits.
+pub(crate) fn path_component(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("_{b:02x}"));
+        }
+    }
+    out
+}
+
+/// Does a pane's `pane.process_info` show the header program in front?
+fn runs_header(info: &serde_json::Value) -> bool {
+    info.pointer("/process_info/foreground_processes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|procs| {
+            procs.iter().any(|p| {
+                let argv = p.get("argv").and_then(serde_json::Value::as_array);
+                argv.and_then(|a| a.first()).and_then(serde_json::Value::as_str).is_some_and(|e| e.ends_with("herdr-mirror"))
+                    && argv.and_then(|a| a.get(1)).and_then(serde_json::Value::as_str) == Some(HEADER_COMMAND)
+            })
+        })
+}
+
+const HEADER_COMMAND: &str = "group-header";
+
+/// A header nobody used: its one tab holds its one pane, still running the
+/// header program. Anything else (a split, a tab, a shell the program never
+/// replaced or that replaced it) may be someone's work, and is kept.
+async fn header_untouched(local: &ApiClient, header: &WsInfo) -> bool {
+    if header.tab_count != Some(1) || header.pane_count != Some(1) {
+        return false;
+    }
+    let Ok(panes) = local.request("pane.list", json!({ "workspace_id": header.workspace_id })).await else {
+        return false;
+    };
+    let ids: Vec<&str> = panes
+        .get("panes")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| a.iter().filter_map(|p| p.get("pane_id")?.as_str()).collect())
+        .unwrap_or_default();
+    let [pane] = ids.as_slice() else { return false };
+    match local.request("pane.process_info", json!({ "pane_id": pane })).await {
+        Ok(info) => runs_header(&info),
+        Err(_) => false,
+    }
+}
+
+/// Replace a new header's placeholder shell with the header program, the way
+/// a mirror pane's streamer is started: typed only while that shell is in
+/// front, and checked.
+fn start_header_pane(local: &ApiClient, pane_id: &str, label: &str, log: &Logger) {
+    let line = format!(
+        "exec {} {HEADER_COMMAND} {}\n",
+        crate::mirror::sh_quote(&crate::util::self_exe()),
+        crate::mirror::sh_quote(label)
+    );
+    let (local, pane_id, log) = (local.clone(), pane_id.to_string(), log.clone());
+    tokio::spawn(async move {
+        for _ in 0..3 {
+            if crate::mirror::await_placeholder_shell(&local, &pane_id).await == crate::mirror::ShellGate::Ready
+                && local.request("pane.send_text", json!({ "pane_id": pane_id, "text": line })).await.is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            match local.request("pane.process_info", json!({ "pane_id": pane_id })).await {
+                Ok(info) if runs_header(&info) => return,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+        log.log(&format!("group header pane {pane_id} is still a shell; it stays open once empty"));
+    });
+}
+
+/// `herdr-mirror group-header <label>`: what a header's pane runs. Says what
+/// the header is and ignores what is typed there, including ^C, so the pane
+/// never drops to a shell someone could start work in.
+pub fn run_header(label: &str) -> Result<()> {
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+    }
+    print!("\x1b[2J\x1b[H");
+    println!("{label}");
+    println!();
+    println!("The mirrors of this machine's workspaces are grouped under this header.");
+    println!("herdr-mirror closes it once the last of them goes.");
+    let mut sink = [0u8; 256];
+    let mut stdin = std::io::stdin();
+    loop {
+        match std::io::Read::read(&mut stdin, &mut sink) {
+            Ok(0) | Err(_) => std::thread::sleep(std::time::Duration::from_secs(3600)),
+            Ok(_) => {}
         }
     }
 }
@@ -431,19 +569,45 @@ pub(crate) mod tests {
     #[test]
     fn a_mirror_belongs_under_its_hosts_group_by_path() {
         let g = grouping(CONFIG);
-        assert_eq!(g.desired_checkout("sb", "w7:T"), Some(PathBuf::from("/g/sb/wt/sb--w7_T")));
-        assert_eq!(g.desired_checkout("ws-1", "w1"), Some(PathBuf::from("/g/sb/wt/ws_1--w1")));
-        assert_eq!(g.desired_checkout("vm", "w1"), Some(PathBuf::from("/g/vm/wt/vm--w1")));
+        assert_eq!(g.desired_checkout("sb", "w7:T"), Some(PathBuf::from("/g/sb/wt/sb+w7_3a_54")));
+        assert_eq!(g.desired_checkout("ws-1", "w1"), Some(PathBuf::from("/g/sb/wt/ws-1+w1")));
+        assert_eq!(g.desired_checkout("vm", "w1"), Some(PathBuf::from("/g/vm/wt/vm+w1")));
         assert_eq!(g.header_label["sb"], "brightlights", "the leading host's prefix");
         let off = grouping(&CONFIG.replace("group_by_host = true", "group_by_host = false"));
         assert_eq!(off.desired_checkout("sb", "w1"), None, "flat when grouping is off");
     }
 
     #[test]
+    fn no_two_names_share_a_path() {
+        let names = ["a.b", "a-b", "a_b", "a b", "A-b", "a-B", "a·b", "a_2eb"];
+        let encoded: HashSet<String> = names.iter().map(|n| path_component(n)).collect();
+        assert_eq!(encoded.len(), names.len(), "{encoded:?}");
+        assert_eq!(path_component("bl-sb-macbook-brightlights2"), "bl-sb-macbook-brightlights2");
+        // the separator in <host>+<rid> is never part of an encoded name
+        assert!(!path_component("a+b").contains('+'));
+    }
+
+    #[test]
+    fn a_group_whose_host_is_absent_keeps_its_name_as_the_header() {
+        let g = grouping("group_by_host = true\n[hosts.ws]\ntarget = \"ws\"\ngroup = \"maker\"\n");
+        assert_eq!(g.desired_checkout("ws", "w1"), Some(PathBuf::from("/g/maker/wt/ws+w1")));
+        assert_eq!(g.header_label["maker"], "maker");
+    }
+
+    #[test]
+    fn only_the_header_program_in_front_reads_as_an_untouched_header() {
+        let info = |argv: &[&str]| json!({ "process_info": { "foreground_processes": [{ "pid": 1, "name": "x", "argv": argv }] } });
+        assert!(runs_header(&info(&["/x/herdr-mirror", "group-header", "sb"])));
+        assert!(!runs_header(&info(&["/bin/sh"])), "a shell someone could use");
+        assert!(!runs_header(&info(&["vim", "notes"])));
+        assert!(!runs_header(&info(&["/x/herdr-mirror", "pane", "sb", "w1:p1"])));
+    }
+
+    #[test]
     fn only_a_linked_worktree_under_the_root_is_a_grouped_mirror() {
         let g = grouping(CONFIG);
-        let child = ws("w2", Some("/g/sb/wt/sb--w1"), Some("/g/sb/main"), true);
-        assert_eq!(g.actual_checkout(&child), Some(PathBuf::from("/g/sb/wt/sb--w1")));
+        let child = ws("w2", Some("/g/sb/wt/sb+w1"), Some("/g/sb/main"), true);
+        assert_eq!(g.actual_checkout(&child), Some(PathBuf::from("/g/sb/wt/sb+w1")));
         assert_eq!(g.actual_checkout(&ws("w3", None, None, false)), None, "a flat mirror");
         let elsewhere = ws("w4", Some("/src/app-wt"), Some("/src/app"), true);
         assert_eq!(g.actual_checkout(&elsewhere), None, "someone's own worktree");
@@ -459,7 +623,7 @@ pub(crate) mod tests {
         let root = Path::new("/g");
         let list = vec![
             ws("w1", Some("/g/sb/main"), Some("/g/sb/main"), false),
-            ws("w2", Some("/g/sb/wt/sb--w1"), Some("/g/sb/main"), true),
+            ws("w2", Some("/g/sb/wt/sb+w1"), Some("/g/sb/main"), true),
             ws("w3", Some("/g/vm/main"), Some("/g/vm/main"), false),
             ws("w4", None, None, false),
             ws("w5", Some("/src/app"), Some("/src/app"), false),
@@ -473,8 +637,8 @@ pub(crate) mod tests {
         // session restore can bring the header back before its mirrors
         let root = Path::new("/g");
         let list = vec![ws("w1", Some("/g/sb/main"), Some("/g/sb/main"), false)];
-        let protected: HashSet<PathBuf> = [PathBuf::from("/g/sb/wt/sb--w1")].into();
-        let plan = plan_tidy(root, &list, &protected, &[PathBuf::from("/g/sb/wt/sb--w1")]);
+        let protected: HashSet<PathBuf> = [PathBuf::from("/g/sb/wt/sb+w1")].into();
+        let plan = plan_tidy(root, &list, &protected, &[PathBuf::from("/g/sb/wt/sb+w1")]);
         assert_eq!(plan, TidyPlan::default());
     }
 
@@ -483,16 +647,16 @@ pub(crate) mod tests {
         let root = Path::new("/g");
         let list = vec![
             ws("w1", Some("/g/sb/main"), Some("/g/sb/main"), false),
-            ws("w2", Some("/g/sb/wt/sb--w1"), Some("/g/sb/main"), true),
+            ws("w2", Some("/g/sb/wt/sb+w1"), Some("/g/sb/main"), true),
         ];
         let children = [
-            PathBuf::from("/g/sb/wt/sb--w1"),
-            PathBuf::from("/g/sb/wt/sb--w2"),
-            PathBuf::from("/g/sb/wt/sb--w3"),
+            PathBuf::from("/g/sb/wt/sb+w1"),
+            PathBuf::from("/g/sb/wt/sb+w2"),
+            PathBuf::from("/g/sb/wt/sb+w3"),
         ];
-        let protected: HashSet<PathBuf> = [PathBuf::from("/g/sb/wt/sb--w2")].into();
+        let protected: HashSet<PathBuf> = [PathBuf::from("/g/sb/wt/sb+w2")].into();
         let plan = plan_tidy(root, &list, &protected, &children);
-        assert_eq!(plan.remove_worktrees, vec![PathBuf::from("/g/sb/wt/sb--w3")]);
+        assert_eq!(plan.remove_worktrees, vec![PathBuf::from("/g/sb/wt/sb+w3")]);
         assert!(plan.close_headers.is_empty());
     }
 
@@ -501,7 +665,7 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("hm-stand-in-repo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let main = dir.join("sb").join("main");
-        let child = dir.join("sb").join("wt").join("sb--w1");
+        let child = dir.join("sb").join("wt").join("sb+w1");
         ensure_repo(&main).await.unwrap();
         ensure_repo(&main).await.unwrap();
         ensure_worktree(&main, &child).await.unwrap();

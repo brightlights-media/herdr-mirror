@@ -141,8 +141,9 @@ pub struct HostConfig {
     /// of the local pane blank instead. Observe is unaffected either way.
     pub max_cols: Option<usize>,
     pub max_rows: Option<usize>,
-    /// The host whose sidebar group this host's mirror workspaces join under
-    /// `group_by_host`: its own name unless `group` names another enabled host.
+    /// The sidebar group this host's mirror workspaces join under
+    /// `group_by_host`: its own name unless `group` names another, which need
+    /// not be a configured host (see `parse_config`).
     pub group: String,
 }
 
@@ -389,25 +390,27 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             name,
         });
     }
-    // A group names a host that leads its own group: one level, so a chain
-    // (a → b → c) or a group naming a disabled host falls back to the host's
-    // own group rather than following it somewhere unexpected.
-    let leaders: Vec<String> = hosts
+    // A group is named after the host that leads it, and stays put while that
+    // host is absent: a group naming a host that is not configured (stopped,
+    // dropped, disabled) is still that group, under a header labelled with
+    // its name, so its mirrors are not moved each time that host comes and
+    // goes. Only a chain (a → b → c) is refused: the host keeps its own group.
+    let followers: Vec<String> = hosts
         .iter()
         .zip(&groups)
-        .filter(|(_, g)| g.is_none())
+        .filter(|(_, g)| g.is_some())
         .map(|(h, _)| h.name.clone())
         .collect();
     for (h, g) in hosts.iter_mut().zip(groups) {
         let Some(g) = g else { continue };
-        if leaders.contains(&g) {
-            h.group = g;
-        } else {
+        if followers.contains(&g) {
             warnings.push(format!(
-                "[hosts.{}]: group \"{g}\" is not an enabled host with a group of its own; \
+                "[hosts.{}]: group \"{g}\" names a host that is itself in another group; \
                  it gets its own group",
                 h.name
             ));
+        } else {
+            h.group = g;
         }
     }
     if hosts.is_empty() {
@@ -802,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn a_group_that_names_no_leading_host_falls_back_to_its_own() {
+    fn a_group_stays_put_while_its_host_is_absent_and_a_chain_is_refused() {
         let c = parse_config(
             "[hosts.a]\ntarget = \"a\"\ngroup = \"gone\"\n\
              [hosts.b]\ntarget = \"b\"\ngroup = \"off\"\n\
@@ -812,10 +815,10 @@ mod tests {
         )
         .unwrap();
         let group = |n: &str| c.hosts.iter().find(|h| h.name == n).unwrap().group.clone();
-        assert_eq!(group("a"), "a", "unknown host");
-        assert_eq!(group("b"), "b", "disabled host");
+        assert_eq!(group("a"), "gone", "a host that is not configured right now");
+        assert_eq!(group("b"), "off", "a disabled host");
         assert_eq!(group("c"), "c", "a chain is not followed: a is itself grouped");
         assert_eq!(group("d"), "d", "naming itself is its own group, silently");
-        assert_eq!(c.warnings.len(), 3, "{:?}", c.warnings);
+        assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
     }
 }
