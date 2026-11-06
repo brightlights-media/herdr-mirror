@@ -141,6 +141,9 @@ pub struct HostConfig {
     /// of the local pane blank instead. Observe is unaffected either way.
     pub max_cols: Option<usize>,
     pub max_rows: Option<usize>,
+    /// The host whose sidebar group this host's mirror workspaces join under
+    /// `group_by_host`: its own name unless `group` names another enabled host.
+    pub group: String,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +158,9 @@ pub struct MirrorConfig {
     /// also closes the matching object on the remote. Set false to make a local
     /// close only stop mirroring, leaving the remote — and any agent — running.
     pub close_remote_on_local_close: bool,
+    /// nest each host's mirror workspaces under one sidebar header per group
+    /// (see `groups.rs`). Default off.
+    pub group_by_host: bool,
     pub hosts: Vec<HostConfig>,
     /// which hosts.toml this came from. `None` when parsed from a string
     /// (tests). Logged at startup so "which config won?" is never a guess.
@@ -183,6 +189,7 @@ struct RawConfig {
     poll_seconds: Option<u64>,
     default_host: Option<String>,
     close_remote_on_local_close: Option<bool>,
+    group_by_host: Option<bool>,
     always_control: Option<bool>,
     label: Option<String>,
     max_cols: Option<usize>,
@@ -210,6 +217,7 @@ struct RawHost {
     max_cols: Option<usize>,
     max_rows: Option<usize>,
     api_transport: Option<String>,
+    group: Option<String>,
 }
 
 /// Resolve `kind` + its ref fields, rejecting combinations that would silently
@@ -310,6 +318,9 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let global_max_cols = size_cap(raw.max_cols);
     let global_max_rows = size_cap(raw.max_rows);
     let mut hosts: Vec<HostConfig> = Vec::new();
+    // each host's `group`, resolved once every host is known: it may name one
+    // declared later
+    let mut groups: Vec<Option<String>> = Vec::new();
     for (name, value) in raw.hosts {
         let h: RawHost = value.try_into().map_err(|e| err(format!("[hosts.{name}]: {e}")))?;
         if h.enabled == Some(false) {
@@ -360,7 +371,9 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
                 }
             },
         };
+        groups.push(h.group.filter(|g| !g.is_empty() && *g != name));
         hosts.push(HostConfig {
+            group: name.clone(),
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             label,
             // empty string is treated as unset (auto PATH → ~/.local/bin/herdr)
@@ -375,6 +388,27 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             target,
             name,
         });
+    }
+    // A group names a host that leads its own group: one level, so a chain
+    // (a → b → c) or a group naming a disabled host falls back to the host's
+    // own group rather than following it somewhere unexpected.
+    let leaders: Vec<String> = hosts
+        .iter()
+        .zip(&groups)
+        .filter(|(_, g)| g.is_none())
+        .map(|(h, _)| h.name.clone())
+        .collect();
+    for (h, g) in hosts.iter_mut().zip(groups) {
+        let Some(g) = g else { continue };
+        if leaders.contains(&g) {
+            h.group = g;
+        } else {
+            warnings.push(format!(
+                "[hosts.{}]: group \"{g}\" is not an enabled host with a group of its own; \
+                 it gets its own group",
+                h.name
+            ));
+        }
     }
     if hosts.is_empty() {
         // Carry the skip reasons into the error. Otherwise a config whose only
@@ -397,6 +431,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         autostart: raw.autostart.unwrap_or(true),
         default_host: raw.default_host,
         close_remote_on_local_close: raw.close_remote_on_local_close.unwrap_or(true),
+        group_by_host: raw.group_by_host.unwrap_or(false),
         hosts,
         source: None,
         shadowed: Vec::new(),
@@ -744,5 +779,43 @@ mod tests {
             "{:?}",
             c.warnings
         );
+    }
+
+    #[test]
+    fn grouping_is_off_unless_asked_and_a_host_leads_its_own_group() {
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(!c.group_by_host, "upstream behaviour stays the default");
+        assert_eq!(c.hosts[0].group, "a");
+        let c = parse_config("group_by_host = true\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(c.group_by_host);
+    }
+
+    #[test]
+    fn a_host_joins_the_group_it_names_even_one_declared_later() {
+        let c = parse_config(
+            "[hosts.ws]\ntarget = \"ws\"\ngroup = \"sb\"\n[hosts.sb]\ntarget = \"sb\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.hosts[0].group, "sb");
+        assert_eq!(c.hosts[1].group, "sb");
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    }
+
+    #[test]
+    fn a_group_that_names_no_leading_host_falls_back_to_its_own() {
+        let c = parse_config(
+            "[hosts.a]\ntarget = \"a\"\ngroup = \"gone\"\n\
+             [hosts.b]\ntarget = \"b\"\ngroup = \"off\"\n\
+             [hosts.off]\ntarget = \"off\"\nenabled = false\n\
+             [hosts.c]\ntarget = \"c\"\ngroup = \"a\"\n\
+             [hosts.d]\ntarget = \"d\"\ngroup = \"d\"\n",
+        )
+        .unwrap();
+        let group = |n: &str| c.hosts.iter().find(|h| h.name == n).unwrap().group.clone();
+        assert_eq!(group("a"), "a", "unknown host");
+        assert_eq!(group("b"), "b", "disabled host");
+        assert_eq!(group("c"), "c", "a chain is not followed: a is itself grouped");
+        assert_eq!(group("d"), "d", "naming itself is its own group, silently");
+        assert_eq!(c.warnings.len(), 3, "{:?}", c.warnings);
     }
 }

@@ -660,6 +660,7 @@ mod tests {
             max_rows: None,
             api_transport: ApiTransport::Auto,
             always_control: true,
+            group: name.into(),
         }
     }
 

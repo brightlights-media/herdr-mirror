@@ -47,6 +47,10 @@
 >   typing in a mirror pane takes control even while another client holds it (`--takeover`), and a
 >   mirror that loses control, or is refused it, watches until someone types there instead of
 >   taking it back, so two mirrors of one pane no longer fight over it or lock each other out.
+> - [`feat/group-mirrors-by-host`](https://github.com/brightlights-media/herdr-mirror/tree/feat/group-mirrors-by-host):
+>   `group_by_host = true` nests each host's mirror workspaces under a collapsible header named by
+>   its prefix (herdr's git worktree nesting, on a stand-in repo per group), and `group = "<host>"`
+>   puts one host's mirrors under another's header. It sits on `brightlights`, not upstream `main`.
 
 A [herdr](https://herdr.dev) plugin that mirrors a remote herdr server's
 workspaces and agents into your local sidebar. One window shows the agents on
@@ -364,6 +368,8 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
                          # A ceiling only, and never applies to watch-only.
 # label = "prefixed"     # default: a mirror workspace reads "<prefix>: <label>".
                          # "remote" shows the remote label alone (see below).
+# group_by_host = false  # true nests each host's mirror workspaces under a
+                         # header named by its prefix (see "Sidebar groups").
 
 [hosts.work]
 target = "work"
@@ -378,6 +384,8 @@ target = "work"
                                      # directly (don't drive its pane sizes)
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
+# group = "vps"                      # with group_by_host, show this host's
+                                     # mirrors under that host's header
 # api_transport = "auto"             # how to reach the remote API socket:
                                      # "socket" = ssh -L forward, "exec" = relay
                                      # over ssh exec (needs socat or python3).
@@ -410,6 +418,34 @@ change of `prefix` or `label`, a mirror still carrying its old stamp, or any
 `<prefix>: <remote label>` form, is restamped from the remote instead, as is
 any rename made before this build first stamped the mirror. A remote rename
 always wins over an older local one.
+
+### Sidebar groups
+
+With `group_by_host = true` each host's mirror workspaces sit under one
+collapsible header in the sidebar, named by the host's `prefix`, instead of
+side by side with your local workspaces. A host with `group = "<other host>"`
+joins that host's header instead of getting its own (one level: the named host
+must not itself name a group, else the host keeps its own header and the log
+says why). It needs `git` on this machine and a local herdr with the worktree
+API (`herdr worktree open`).
+
+herdr nests a workspace only under the main checkout of a git repo it is a
+linked worktree of, so the daemon keeps a small stand-in repo per group in
+`~/.cache/herdr-mirror/groups/<host>/` (`main/`, one empty commit on a branch
+named `mirror`) and opens each mirror workspace on a worktree of it
+(`wt/<host>--<remote workspace id>`). The header is a workspace on `main/`
+with a plain shell; the worktrees only give each mirror a place to belong, and
+the mirror panes stream the remote as always.
+
+The header comes and goes with its mirrors: it is made when the group's first
+mirror is, and closed when the last one goes (the remote closed it, you closed
+it, `hide`, `teardown`). Each worktree is removed with its mirror. Turning
+`group_by_host` on or off, or changing a host's `group`, moves the existing
+mirrors on the next sync by closing them and opening them again in the right
+place: nothing on the remote changes, and the new panes stream the same remote
+panes. Local workspaces are never touched. Closing a header yourself closes
+the group; with `close_remote_on_local_close = true` that closes each mirror's
+remote workspace too, as closing the mirrors one by one would.
 
 ## Devcontainer
 
@@ -501,8 +537,9 @@ identified as disposable merely because their directory matches.
   branch and status stay visible in the streamed pane's prompt.
 - **No custom sidebar UI** (plugin API limitation): mirrors carry a `<host>: `
   label prefix (or none, with `label = "remote"`) and the daemon keeps them
-  ordered into per-host groups, but it can't render a richer affordance (group
-  headers, collapse, colour).
+  ordered into per-host groups. A collapsible header per host is only had
+  through herdr's git worktree nesting (`group_by_host`), which is why that
+  header is a real workspace with a shell in it.
 - **Remote must be reachable and running herdr**; the daemon surfaces a
   readable status if a host is down or on too old a version.
 - **ssh hosts whose sshd won't service streamlocal forwards** (some embedded
