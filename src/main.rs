@@ -83,6 +83,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             daemon::cmd_ensure(&Env::resolve()?);
             Ok(())
         }
+        "group-header" => groups::run_header(rest.get(1).map_or("", String::as_str)),
         "status" => daemon::cmd_status(&Env::resolve()?),
         "once" => rt.block_on(daemon::cmd_once(Env::resolve()?)),
         "restore" => daemon::cmd_restore(
@@ -137,7 +138,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             rt.block_on(binding::unbind(Env::resolve()?, what))
         }
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|hide|show|pick-workspace|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
+            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|hide|show|group-header|pick-workspace|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
         ))),
     }
 }

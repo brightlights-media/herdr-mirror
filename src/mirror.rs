@@ -605,7 +605,7 @@ pub(crate) fn cmd_for_pane(
 }
 
 /// single-quote for a POSIX shell command line
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -859,7 +859,7 @@ pub(crate) async fn spawn_streamer_pane(
 
 /// Whether a streamer launch may be typed into a pane now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShellGate {
+pub(crate) enum ShellGate {
     /// the shell herdr started there is in the foreground: type
     Ready,
     /// that shell is running something in the foreground (a startup-file
@@ -877,7 +877,7 @@ const BUSY_SHELL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Poll the pane until its placeholder shell is in the foreground. Busy past
 /// `BUSY_SHELL_WAIT` answers `Busy`; the caller tries again on its next round.
-async fn await_placeholder_shell(local: &ApiClient, pane_id: &str) -> ShellGate {
+pub(crate) async fn await_placeholder_shell(local: &ApiClient, pane_id: &str) -> ShellGate {
     let deadline = tokio::time::Instant::now() + BUSY_SHELL_WAIT;
     loop {
         let gate = match local.request("pane.process_info", json!({ "pane_id": pane_id })).await {
@@ -977,25 +977,47 @@ fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String
     }
 }
 
+/// What `misplaced_mirrors` found.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Misplaced {
+    /// remote id → local id of each mirror workspace to move
+    pub moved: BTreeMap<String, String>,
+    /// local ids of misplaced mirror workspaces left where they are, because
+    /// a pane in them is not one of this host's mirror panes: something the
+    /// user split or opened there, which moving would close
+    pub held: Vec<String>,
+}
+
 /// The live mirror workspaces of this host that are not where grouping wants
-/// them, as remote id → local id. Pure, so the decision is testable.
+/// them. Moving closes the local workspace, so only one made solely of this
+/// host's mapped mirror panes moves. Pure, so the decision is testable.
 pub(crate) fn misplaced_mirrors(
     grouping: &crate::groups::Grouping,
     host_name: &str,
     state: &HostState,
     local: &[WsInfo],
-) -> BTreeMap<String, String> {
+    local_panes: &[PaneInfo],
+) -> Misplaced {
     let by_id: HashMap<&str, &WsInfo> = local.iter().map(|w| (w.workspace_id.as_str(), w)).collect();
-    state
-        .workspaces
-        .iter()
-        .filter(|(_, e)| !e.is_tombstoned())
-        .filter_map(|(rid, e)| {
-            let ws = by_id.get(e.local_id.as_str())?;
-            (grouping.desired_checkout(host_name, rid) != grouping.actual_checkout(ws))
-                .then(|| (rid.clone(), e.local_id.clone()))
-        })
-        .collect()
+    let mirror_panes: HashSet<&str> =
+        state.panes.values().filter(|e| !e.is_tombstoned()).map(|e| e.local_id.as_str()).collect();
+    let mut out = Misplaced::default();
+    for (rid, e) in state.workspaces.iter().filter(|(_, e)| !e.is_tombstoned()) {
+        let Some(ws) = by_id.get(e.local_id.as_str()) else { continue };
+        if grouping.desired_checkout(host_name, rid) == grouping.actual_checkout(ws) {
+            continue;
+        }
+        let only_mirrors = local_panes
+            .iter()
+            .filter(|p| p.workspace_id == e.local_id)
+            .all(|p| mirror_panes.contains(p.pane_id.as_str()));
+        if only_mirrors {
+            out.moved.insert(rid.clone(), e.local_id.clone());
+        } else {
+            out.held.push(e.local_id.clone());
+        }
+    }
+    out
 }
 
 /// Close the mirrors `misplaced_mirrors` found so this pass makes them again
@@ -1252,7 +1274,16 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     //     is on, under another group, or grouped while it is off) is closed and
     //     made again where it belongs. The remote is untouched: its panes keep
     //     running, and the new mirror streams them again.
-    let moved = misplaced_mirrors(&deps.grouping, &host.name, state, &local_snap.workspaces);
+    let Misplaced { moved, held } =
+        misplaced_mirrors(&deps.grouping, &host.name, state, &local_snap.workspaces, &local_snap.panes);
+    for local_id in held {
+        if deps.grouping.first_notice(&format!("held {}/{local_id}", host.name)) {
+            log.log(&format!(
+                "not moving mirror workspace {local_id} to where group_by_host puts it: it holds a pane \
+                 that is not a mirror, which moving would close"
+            ));
+        }
+    }
     if !moved.is_empty() {
         relocate_mirrors(deps, state, &remote_snap, &moved, &cmd_for).await;
         for local_id in moved.values() {
@@ -2825,26 +2856,60 @@ mod tests {
         let state = mapped(&[("w1", "L1", false), ("w2", "L2", false), ("w3", "L3", true), ("w4", "L4", false)]);
         let local = vec![
             ws("L1", None, None, false),
-            ws("L2", Some("/g/sb/wt/ws--w2"), Some("/g/sb/main"), true),
+            ws("L2", Some("/g/sb/wt/ws+w2"), Some("/g/sb/main"), true),
             ws("L3", None, None, false),
         ];
-        let moved = misplaced_mirrors(&g, "ws", &state, &local);
+        let moved = misplaced_mirrors(&g, "ws", &state, &local, &[]).moved;
         // L1 is flat, L2 is already in place, L3 is tombstoned, L4 is not on screen
         assert_eq!(moved, BTreeMap::from([("w1".to_string(), "L1".to_string())]));
+    }
+
+    fn lpane(id: &str, ws: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: id.into(),
+            tab_id: format!("{ws}:t1"),
+            workspace_id: ws.into(),
+            label: None,
+            cwd: None,
+            foreground_cwd: None,
+        }
+    }
+
+    /// Moving closes the local workspace: a shell the user split into a
+    /// mirror, or a tab they opened there, would go with it.
+    #[test]
+    fn a_mirror_holding_a_pane_that_is_not_a_mirror_stays_where_it_is() {
+        use crate::groups::tests::ws;
+        let g = grouping(GROUPED);
+        let mut state = mapped(&[("w1", "L1", false), ("w2", "L2", false)]);
+        for (rid, local, tomb) in [("p1", "L1:p1", false), ("p2", "L2:p1", false), ("p3", "L2:p2", true)] {
+            state.panes.insert(
+                rid.into(),
+                PaneEntry { local_id: local.into(), tombstone: tomb.then_some(true), seq: 0, reported: None },
+            );
+        }
+        let local = vec![ws("L1", None, None, false), ws("L2", None, None, false)];
+        let panes = vec![lpane("L1:p1", "L1"), lpane("L2:p1", "L2"), lpane("L2:p9", "L2")];
+        let m = misplaced_mirrors(&g, "ws", &state, &local, &panes);
+        assert_eq!(m.moved, BTreeMap::from([("w1".to_string(), "L1".to_string())]));
+        assert_eq!(m.held, vec!["L2".to_string()], "L2:p9 is no mirror pane");
+        // a pane whose mirror the user closed is not one of ours either
+        let panes = vec![lpane("L1:p1", "L1"), lpane("L2:p2", "L2")];
+        assert_eq!(misplaced_mirrors(&g, "ws", &state, &local, &panes).held, vec!["L2".to_string()]);
     }
 
     #[test]
     fn a_mirror_under_the_wrong_group_or_any_group_when_off_moves() {
         use crate::groups::tests::ws;
         let state = mapped(&[("w1", "L1", false)]);
-        let local = vec![ws("L1", Some("/g/ws/wt/ws--w1"), Some("/g/ws/main"), true)];
-        let moved = misplaced_mirrors(&grouping(GROUPED), "ws", &state, &local);
+        let local = vec![ws("L1", Some("/g/ws/wt/ws+w1"), Some("/g/ws/main"), true)];
+        let moved = misplaced_mirrors(&grouping(GROUPED), "ws", &state, &local, &[]).moved;
         assert_eq!(moved.len(), 1, "its own group, but its config now names sb's");
         let off = grouping(&GROUPED.replace("group_by_host = true", "group_by_host = false"));
-        let local = vec![ws("L1", Some("/g/sb/wt/ws--w1"), Some("/g/sb/main"), true)];
-        assert_eq!(misplaced_mirrors(&off, "ws", &state, &local).len(), 1, "flattened when off");
+        let local = vec![ws("L1", Some("/g/sb/wt/ws+w1"), Some("/g/sb/main"), true)];
+        assert_eq!(misplaced_mirrors(&off, "ws", &state, &local, &[]).moved.len(), 1, "flattened when off");
         let flat = vec![ws("L1", None, None, false)];
-        assert!(misplaced_mirrors(&off, "ws", &state, &flat).is_empty(), "flat stays flat when off");
+        assert!(misplaced_mirrors(&off, "ws", &state, &flat, &[]).moved.is_empty(), "flat stays flat when off");
     }
 
     #[test]
@@ -2855,8 +2920,8 @@ mod tests {
         let groups = vec![group(&[], None), group(&[], None), group(&[], None)];
         let rank = |w: &WsInfo| sidebar_rank(w, &config.hosts, &groups, &g);
         assert_eq!(rank(&ws("H", Some("/g/sb/main"), Some("/g/sb/main"), false)), 1);
-        assert_eq!(rank(&ws("C", Some("/g/sb/wt/ws--w1"), Some("/g/sb/main"), true)), 1);
-        assert_eq!(rank(&ws("V", Some("/g/vm/wt/vm--w1"), Some("/g/vm/main"), true)), 3);
+        assert_eq!(rank(&ws("C", Some("/g/sb/wt/ws+w1"), Some("/g/sb/main"), true)), 1);
+        assert_eq!(rank(&ws("V", Some("/g/vm/wt/vm+w1"), Some("/g/vm/main"), true)), 3);
         assert_eq!(rank(&ws("L", None, None, false)), 0, "a local workspace");
         assert_eq!(rank(&ws("O", Some("/src/app"), Some("/src/app"), false)), 0, "a local repo");
     }
