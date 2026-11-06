@@ -163,6 +163,7 @@ struct HostCtx {
     log: Logger,
     close_remote_on_local_close: bool,
     closes: crate::closes::Closes,
+    grouping: std::sync::Arc<crate::groups::Grouping>,
 }
 
 const BROADCAST_SUBS: &[&str] = &[
@@ -324,12 +325,14 @@ async fn run_connected(
         log: ctx.log.clone(),
         close_remote_on_local_close: ctx.close_remote_on_local_close,
         closes: ctx.closes.clone(),
+        grouping: ctx.grouping.clone(),
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
     // converge must prune the map before the per-pane upgrade
     let mut stream = remote.subscribe(sub_list(&[])).await?;
     let mut subscribed_key = String::from("<broadcast>");
     let state = converge(&deps).await?;
+    ctx.grouping.tidy(&ctx.local, &ctx.env_state_dir, &ctx.log).await;
     apply_focus_request(ctx, &state).await;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
@@ -403,6 +406,9 @@ async fn run_connected(
                     )
                     .await;
                     let state = converge(&deps).await?;
+                    // a mirror this pass closed or tombstoned may leave its
+                    // group's header and its own worktree unused
+                    ctx.grouping.tidy(&ctx.local, &ctx.env_state_dir, &ctx.log).await;
                     apply_focus_request(ctx, &state).await;
                     // pane set may have changed
                     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
@@ -638,6 +644,7 @@ async fn local_events_task(
     state_dir: PathBuf,
     log: Logger,
     closes: crate::closes::Closes,
+    grouping: std::sync::Arc<crate::groups::Grouping>,
 ) {
     loop {
         let subs = vec![
@@ -660,11 +667,12 @@ async fn local_events_task(
         match local.subscribe(subs).await {
             Ok(mut stream) => {
                 // catch a sidebar left ungrouped from a previous run
-                regroup_sidebar(&local, &hosts, &state_dir, &log).await;
+                regroup_sidebar(&local, &hosts, &state_dir, &grouping, &log).await;
                 // subscribe succeeding after a drop = the server is back up;
                 // give session-restore a beat, then sweep for zombie mirrors
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 heal_zombie_mirrors(&local, &state_dir, &hosts, &pokers, &log).await;
+                grouping.tidy(&local, &state_dir, &log).await;
                 while let Some(e) = stream.next().await {
                     // A close EVENT is the authoritative "the user closed this";
                     // snapshot absence is not (rebuild/restart/failed converge).
@@ -685,8 +693,12 @@ async fn local_events_task(
                     for p in &pokers {
                         let _ = p.try_send(());
                     }
+                    // a mirror left: its group may be empty, its worktree unused
+                    if e.event == "workspace_closed" {
+                        grouping.tidy(&local, &state_dir, &log).await;
+                    }
                     // a workspace appeared/left — keep hosts grouped (no-op if already)
-                    regroup_sidebar(&local, &hosts, &state_dir, &log).await;
+                    regroup_sidebar(&local, &hosts, &state_dir, &grouping, &log).await;
                 }
                 log.log("local event stream dropped — resubscribing");
             }
@@ -741,6 +753,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             .await;
     }
     let closes = crate::closes::new_closes();
+    let grouping = std::sync::Arc::new(crate::groups::Grouping::new(&config, crate::groups::default_root()));
     let mut pokers: Vec<mpsc::Sender<()>> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for h in &config.hosts {
@@ -753,6 +766,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
             closes: closes.clone(),
+            grouping: grouping.clone(),
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
@@ -763,6 +777,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         env.state_dir.clone(),
         log.clone(),
         closes.clone(),
+        grouping.clone(),
     )));
 
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -959,6 +974,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
     let log = Logger::new(&env.state_dir, true);
     let config = load_config(&env.config_search)?;
     let local = ApiClient::connect(&env.local_socket).await?;
+    let grouping = std::sync::Arc::new(crate::groups::Grouping::new(&config, crate::groups::default_root()));
     for h in &config.hosts {
         // converge would only freeze anyway, and dialling a host someone hid
         // *because* it is dead would abort the whole run with `?`
@@ -979,6 +995,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             // close signal — an empty tracker means this pass syncs but never
             // closes a remote object, which is the correct conservative default
             closes: crate::closes::new_closes(),
+            grouping: grouping.clone(),
         })
         .await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));
@@ -1059,6 +1076,8 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
     for h in &config.hosts {
         teardown(&local, &env.state_dir, &h.name, &log, None).await?;
     }
+    // with every map empty, this closes the group headers and their worktrees
+    crate::groups::Grouping::new(&config, crate::groups::default_root()).tidy(&local, &env.state_dir, &log).await;
     log.log("teardown complete (autostart paused until next start)");
     Ok(())
 }

@@ -40,6 +40,11 @@ pub struct WsInfo {
 pub struct WsWorktree {
     pub checkout_path: Option<String>,
     pub repo_name: Option<String>,
+    /// the repo's main checkout; for a linked worktree, not its own
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub is_linked_worktree: Option<bool>,
 }
 
 fn dir_name(path: &str) -> Option<&str> {
@@ -519,6 +524,8 @@ pub struct ConvergeDeps {
     /// ambiguous (rebuild in flight, failed converge, server restart), so only a
     /// close event that wasn't our own may close the remote.
     pub closes: crate::closes::Closes,
+    /// sidebar groups (`group_by_host`), shared by every host of the daemon
+    pub grouping: std::sync::Arc<crate::groups::Grouping>,
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -970,6 +977,88 @@ fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String
     }
 }
 
+/// The live mirror workspaces of this host that are not where grouping wants
+/// them, as remote id → local id. Pure, so the decision is testable.
+pub(crate) fn misplaced_mirrors(
+    grouping: &crate::groups::Grouping,
+    host_name: &str,
+    state: &HostState,
+    local: &[WsInfo],
+) -> BTreeMap<String, String> {
+    let by_id: HashMap<&str, &WsInfo> = local.iter().map(|w| (w.workspace_id.as_str(), w)).collect();
+    state
+        .workspaces
+        .iter()
+        .filter(|(_, e)| !e.is_tombstoned())
+        .filter_map(|(rid, e)| {
+            let ws = by_id.get(e.local_id.as_str())?;
+            (grouping.desired_checkout(host_name, rid) != grouping.actual_checkout(ws))
+                .then(|| (rid.clone(), e.local_id.clone()))
+        })
+        .collect()
+}
+
+/// Close the mirrors `misplaced_mirrors` found so this pass makes them again
+/// where they belong. Their map entries go first and every id is marked as our
+/// own close, the order `teardown` uses: a close nothing claims can never be
+/// read as the user's, so it cannot close the remote whatever
+/// `close_remote_on_local_close` says. A pane mirror the user closed keeps its
+/// tombstone.
+async fn relocate_mirrors(
+    deps: &ConvergeDeps,
+    state: &mut HostState,
+    remote_snap: &Snapshot,
+    moved: &BTreeMap<String, String>,
+    cmd_for: &impl Fn(&str) -> Vec<String>,
+) {
+    let mut doomed: Vec<String> = Vec::new();
+    let mut streamed: Vec<(String, String)> = Vec::new();
+    for t in remote_snap.tabs.iter().filter(|t| moved.contains_key(&t.workspace_id)) {
+        if let Some(e) = state.tabs.remove(&t.tab_id) {
+            doomed.push(e.local_id);
+        }
+    }
+    for p in remote_snap.panes.iter().filter(|p| moved.contains_key(&p.workspace_id)) {
+        if state.panes.get(&p.pane_id).is_some_and(|e| !e.is_tombstoned()) {
+            let e = state.panes.remove(&p.pane_id).unwrap();
+            streamed.push((p.pane_id.clone(), e.local_id.clone()));
+            doomed.push(e.local_id);
+        }
+    }
+    for (rid, local_id) in moved {
+        state.workspaces.remove(rid);
+        doomed.push(local_id.clone());
+    }
+    for id in &doomed {
+        mark_self_close(deps, id);
+    }
+    if let Err(e) = save_state(&deps.state_dir, &deps.host.name, state) {
+        // closing with the entries still on disk is what must not happen
+        deps.log.log(&format!("not moving mirrors: could not save state: {e}"));
+        return;
+    }
+    for (rid, local_id) in moved {
+        deps.log.log(&format!("moving mirror workspace {local_id} (remote {rid}) to where group_by_host puts it"));
+        if let Err(e) = deps.local.request("workspace.close", json!({ "workspace_id": local_id })).await {
+            deps.log.log(&format!("close failed for {local_id}: {e}"));
+        }
+    }
+    // The new panes' streamers are refused while an old one for the same
+    // remote pane still holds its pidfile, which would leave them bare
+    // shells; the old ones exit as their panes close.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    for (rid, local_id) in &streamed {
+        let argv = cmd_for(rid);
+        let (Some(target), Some(pane)) = (argv.get(2), argv.get(3)) else { continue };
+        while (crate::util::streamer_alive(&deps.state_dir, target, pane)
+            || crate::util::pane_streamer_alive(&deps.state_dir, local_id))
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
 /// Returns the post-converge state so callers don't re-read the state file.
 pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
     let mut state = load_state(&deps.state_dir, &deps.host.name);
@@ -1159,6 +1248,18 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
 
+    // 2b. a mirror in the wrong place for `group_by_host` (flat while grouping
+    //     is on, under another group, or grouped while it is off) is closed and
+    //     made again where it belongs. The remote is untouched: its panes keep
+    //     running, and the new mirror streams them again.
+    let moved = misplaced_mirrors(&deps.grouping, &host.name, state, &local_snap.workspaces);
+    if !moved.is_empty() {
+        relocate_mirrors(deps, state, &remote_snap, &moved, &cmd_for).await;
+        for local_id in moved.values() {
+            local_ws_ids.remove(local_id);
+        }
+    }
+
     // 3. remote workspaces → ensure mirrors exist with the right label
     for rws in &remote_snap.workspaces {
         if mirror_ws_ids.contains(&rws.workspace_id) {
@@ -1237,9 +1338,17 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             // maps whose panes are all mirror placeholders. A label alone can't
             // say it is ours — under `label = "remote"` a local workspace or
             // another host's mirror may carry the same one.
+            //
+            // A grouped mirror is adopted by its checkout instead (worktree.open
+            // answers with the workspace already open there), so only a flat
+            // one is looked for here.
+            let grouped = deps.grouping.desired_checkout(&host.name, &rws.workspace_id).is_some();
             let mapped = crate::state::mapped_local_workspaces(&deps.state_dir);
             let orphan = local_snap.workspaces.iter().find(|w| {
-                w.label == label
+                !grouped
+                    && w.label == label
+                    && local_ws_ids.contains(&w.workspace_id)
+                    && deps.grouping.actual_checkout(w).is_none()
                     && !mapped.contains(&w.workspace_id)
                     && !state.workspaces.values().any(|e| e.local_id == w.workspace_id)
                     && is_placeholder_workspace(&local_snap.panes, &w.workspace_id)
@@ -1254,6 +1363,25 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     } else {
                         None
                     },
+                    last_remote_label: Some(rws.label.clone()),
+                    last_local_label: Some(label.clone()),
+                }
+            } else if grouped {
+                let opened =
+                    deps.grouping.open_child(&deps.local, &host.name, &rws.workspace_id, &label, log).await?;
+                if opened.already_open {
+                    log.log(&format!("adopting mirror workspace {label} ({})", opened.workspace_id));
+                } else {
+                    log.log(&format!("creating mirror workspace {label} under its group"));
+                }
+                // a fresh workspace's one tab is the root tab the first remote
+                // tab's layout.apply takes over; an adopted one's only when it
+                // is still a single pane
+                let root_tab = !opened.already_open || (opened.tab_count == Some(1) && opened.pane_count == Some(1));
+                WsEntry {
+                    local_id: opened.workspace_id,
+                    tombstone: None,
+                    root_tab_local_id: root_tab.then_some(opened.tab_id),
                     last_remote_label: Some(rws.label.clone()),
                     last_local_label: Some(label.clone()),
                 }
@@ -1874,6 +2002,13 @@ fn ws_rank(id: &str, label: &str, groups: &[HostGroup]) -> usize {
         .map_or(0, |i| i + 1)
 }
 
+fn sidebar_rank(w: &WsInfo, hosts: &[HostConfig], groups: &[HostGroup], grouping: &crate::groups::Grouping) -> usize {
+    match grouping.ws_group_main(w) {
+        Some(main) => hosts.iter().position(|h| grouping.main_dir(&h.group) == main).map_or(0, |i| i + 1),
+        None => ws_rank(&w.workspace_id, &w.label, groups),
+    }
+}
+
 /// Pure planner: given the current `(workspace_id, rank)` order, return the
 /// `(workspace_id, insert_index)` workspace.move calls that group the sidebar
 /// (locals first, then mirror ranks ascending, preserving order within each
@@ -1927,13 +2062,22 @@ fn plan_regroup(current: &[(String, usize)]) -> Vec<(String, usize)> {
 /// host's id map (see `ws_rank`), and only ever moves mirror rows — local
 /// workspaces are never reordered (they group as a side effect of mirror rows
 /// being pushed below them). Idempotent: issues no moves when already grouped.
-pub async fn regroup_sidebar(local: &ApiClient, hosts: &[HostConfig], state_dir: &std::path::Path, log: &Logger) {
+///
+/// Under `group_by_host` a header and the mirrors nested under it take the rank
+/// of the group's first host, so each group moves as one block.
+pub async fn regroup_sidebar(
+    local: &ApiClient,
+    hosts: &[HostConfig],
+    state_dir: &std::path::Path,
+    grouping: &crate::groups::Grouping,
+    log: &Logger,
+) {
     let Ok(snap) = fetch_snapshot(local).await else { return };
     let groups = host_groups(state_dir, hosts);
     let current: Vec<(String, usize)> = snap
         .workspaces
         .iter()
-        .map(|w| (w.workspace_id.clone(), ws_rank(&w.workspace_id, &w.label, &groups)))
+        .map(|w| (w.workspace_id.clone(), sidebar_rank(w, hosts, &groups, grouping)))
         .collect();
     for (ws, insert_index) in plan_regroup(&current) {
         if !move_ws(local, &ws, insert_index).await {
@@ -2001,6 +2145,7 @@ mod tests {
             max_cols: None,
             max_rows: None,
             api_transport: crate::config::ApiTransport::Auto,
+            group: "vps".into(),
         }
     }
 
@@ -2370,6 +2515,7 @@ mod tests {
             worktree: checkout.map(|c| WsWorktree {
                 checkout_path: Some(c.into()),
                 repo_name: Some("brightlights".into()),
+                ..Default::default()
             }),
         }
     }
@@ -2653,5 +2799,65 @@ mod tests {
         });
         let info: AgentInfo = serde_json::from_value(data).unwrap();
         assert!(!info.has_agent());
+    }
+
+    const GROUPED: &str = "group_by_host = true\n\
+        [hosts.sb]\ntarget = \"sb\"\n\
+        [hosts.ws]\ntarget = \"ws\"\ngroup = \"sb\"\n\
+        [hosts.vm]\ntarget = \"vm\"\n";
+
+    fn grouping(toml: &str) -> crate::groups::Grouping {
+        crate::groups::Grouping::for_tests(&crate::config::parse_config(toml).unwrap(), "/g")
+    }
+
+    fn mapped(entries: &[(&str, &str, bool)]) -> HostState {
+        let mut state = HostState::default();
+        for (rid, local, tomb) in entries {
+            state.workspaces.insert(rid.to_string(), ws_entry(local, *tomb));
+        }
+        state
+    }
+
+    #[test]
+    fn a_flat_mirror_moves_under_its_group_and_a_placed_one_stays() {
+        use crate::groups::tests::ws;
+        let g = grouping(GROUPED);
+        let state = mapped(&[("w1", "L1", false), ("w2", "L2", false), ("w3", "L3", true), ("w4", "L4", false)]);
+        let local = vec![
+            ws("L1", None, None, false),
+            ws("L2", Some("/g/sb/wt/ws--w2"), Some("/g/sb/main"), true),
+            ws("L3", None, None, false),
+        ];
+        let moved = misplaced_mirrors(&g, "ws", &state, &local);
+        // L1 is flat, L2 is already in place, L3 is tombstoned, L4 is not on screen
+        assert_eq!(moved, BTreeMap::from([("w1".to_string(), "L1".to_string())]));
+    }
+
+    #[test]
+    fn a_mirror_under_the_wrong_group_or_any_group_when_off_moves() {
+        use crate::groups::tests::ws;
+        let state = mapped(&[("w1", "L1", false)]);
+        let local = vec![ws("L1", Some("/g/ws/wt/ws--w1"), Some("/g/ws/main"), true)];
+        let moved = misplaced_mirrors(&grouping(GROUPED), "ws", &state, &local);
+        assert_eq!(moved.len(), 1, "its own group, but its config now names sb's");
+        let off = grouping(&GROUPED.replace("group_by_host = true", "group_by_host = false"));
+        let local = vec![ws("L1", Some("/g/sb/wt/ws--w1"), Some("/g/sb/main"), true)];
+        assert_eq!(misplaced_mirrors(&off, "ws", &state, &local).len(), 1, "flattened when off");
+        let flat = vec![ws("L1", None, None, false)];
+        assert!(misplaced_mirrors(&off, "ws", &state, &flat).is_empty(), "flat stays flat when off");
+    }
+
+    #[test]
+    fn a_group_ranks_as_its_first_host_and_moves_as_one_block() {
+        use crate::groups::tests::ws;
+        let config = crate::config::parse_config(GROUPED).unwrap();
+        let g = grouping(GROUPED);
+        let groups = vec![group(&[], None), group(&[], None), group(&[], None)];
+        let rank = |w: &WsInfo| sidebar_rank(w, &config.hosts, &groups, &g);
+        assert_eq!(rank(&ws("H", Some("/g/sb/main"), Some("/g/sb/main"), false)), 1);
+        assert_eq!(rank(&ws("C", Some("/g/sb/wt/ws--w1"), Some("/g/sb/main"), true)), 1);
+        assert_eq!(rank(&ws("V", Some("/g/vm/wt/vm--w1"), Some("/g/vm/main"), true)), 3);
+        assert_eq!(rank(&ws("L", None, None, false)), 0, "a local workspace");
+        assert_eq!(rank(&ws("O", Some("/src/app"), Some("/src/app"), false)), 0, "a local repo");
     }
 }
