@@ -3,9 +3,9 @@
 > **Brightlights fork.** This is [brightlights-media/herdr-mirror](https://github.com/brightlights-media/herdr-mirror),
 > a fork of [nikok6/herdr-mirror](https://github.com/nikok6/herdr-mirror) that carries fixes not yet
 > upstream. The `brightlights` branch is upstream `main` with each fix merged in, and its releases are
-> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.8` and so on), so `herdr plugin list` tells it
+> tagged `v<upstream>-bl.<n>` (plugin version `0.4.3-bl.9` and so on), so `herdr plugin list` tells it
 > apart from upstream. Install it with
-> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.8`.
+> `herdr plugin install brightlights-media/herdr-mirror --ref v0.4.3-bl.9`.
 > Each fix lives on its own branch, one commit off upstream `main` (`fix/short-escape-window` sits
 > on `fix/lone-escape-held-until-next-key`, and `fix/placeholder-gate-transient-process-info` on
 > `fix/streamer-launch-never-types-into-live-pane`), ready to offer upstream:
