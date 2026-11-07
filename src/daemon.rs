@@ -266,7 +266,8 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
         }
         let info: AgentInfo = serde_json::from_value(data).unwrap_or_default();
         let agent = info.has_agent().then_some(&info);
-        push_pane_status(&ctx.local, &ctx.host.name, &remote_id, entry, agent, &ctx.log).await;
+        // a status event carries no tokens: those sync on the next converge
+        push_pane_status(&ctx.local, &ctx.host.name, &remote_id, entry, agent, None, &ctx.log).await;
     }
     if let Err(e) = save_state(&ctx.env_state_dir, &ctx.host.name, &state) {
         ctx.log.log(&format!("[{}] state save failed: {e}", ctx.host.name));
