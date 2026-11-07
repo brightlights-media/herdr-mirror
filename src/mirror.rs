@@ -6,7 +6,7 @@
 // mirror locally" (tombstone — don't recreate) from "remote object went away"
 // (close the mirror).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -85,6 +85,10 @@ pub struct PaneInfo {
     pub label: Option<String>,
     pub cwd: Option<String>,
     pub foreground_cwd: Option<String>,
+    /// the pane's metadata tokens: on the local side, what a mirror pane
+    /// currently shows. `default`: herdr omits an empty map.
+    #[serde(default)]
+    pub tokens: HashMap<String, String>,
 }
 
 /// Agent fields as they appear both in snapshot `agents[]` and in
@@ -1396,6 +1400,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     },
                     last_remote_label: Some(rws.label.clone()),
                     last_local_label: Some(label.clone()),
+                    forwarded_tokens: None,
                 }
             } else if grouped {
                 let opened =
@@ -1415,6 +1420,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     root_tab_local_id: root_tab.then_some(opened.tab_id),
                     last_remote_label: Some(rws.label.clone()),
                     last_local_label: Some(label.clone()),
+                    forwarded_tokens: None,
                 }
             } else {
                 log.log(&format!("creating mirror workspace {label}"));
@@ -1448,6 +1454,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     root_tab_local_id: Some(created.tab.tab_id),
                     last_remote_label: Some(rws.label.clone()),
                     last_local_label: Some(label.clone()),
+                    forwarded_tokens: None,
                 }
             };
             local_ws_ids.insert(entry.local_id.clone());
@@ -1461,23 +1468,33 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 
     // 3b. forward the remote's workspace tokens onto the mirror rows, so a mirror
     //     carries the same values a native workspace does under whatever layout is
-    //     configured locally. Ignored by a pre-0.7.4 local server.
+    //     configured locally, and clear the ones the remote has since dropped.
+    //     Ignored by a pre-0.7.4 local server.
     let source = mirror_source(&host.name);
     for rws in &remote_snap.workspaces {
-        if rws.tokens.is_empty() {
-            continue; // nothing to forward (also the pre-0.7.4 remote case)
-        }
-        let Some(entry) = state.workspaces.get(&rws.workspace_id) else { continue };
+        let Some(entry) = state.workspaces.get_mut(&rws.workspace_id) else { continue };
         if entry.is_tombstoned() || !local_ws_ids.contains(&entry.local_id) {
             continue;
         }
-        let _ = deps
+        let forwarded = entry.forwarded_tokens.get_or_insert_with(|| {
+            let local = local_snap.workspaces.iter().find(|w| w.workspace_id == entry.local_id);
+            local.map(|w| w.tokens.keys().cloned().collect()).unwrap_or_default()
+        });
+        let (patch, keep) = token_patch(forwarded, &rws.tokens);
+        if patch.is_empty() {
+            continue; // nothing to set or clear (also the pre-0.7.4 remote case)
+        }
+        let sent = deps
             .local
             .request(
                 "workspace.report_metadata",
-                json!({ "workspace_id": entry.local_id, "source": source, "tokens": rws.tokens }),
+                json!({ "workspace_id": entry.local_id, "source": source, "tokens": patch }),
             )
             .await;
+        // a failed clear stays remembered, so the next pass retries it
+        if sent.is_ok() {
+            entry.forwarded_tokens = Some(keep);
+        }
     }
 
     // 4. remote tabs → replicate layout with wrapper commands
@@ -1575,7 +1592,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     let seq = state.panes.get(rid).map(|e| e.seq).unwrap_or(0);
                     state.panes.insert(
                         rid.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq, reported: None },
+                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq, reported: None, forwarded_tokens: None },
                     );
                     fresh.push(local_id.clone());
                     to_spawn.push((local_id, rid.clone()));
@@ -1643,7 +1660,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     // unmapped placeholder panes 250ms after pane.created
                     state.panes.insert(
                         place.pane.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
+                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None, forwarded_tokens: None },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
                     spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&place.pane), &deps.log)
@@ -1679,7 +1696,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         split_mirror_pane(&deps.local, &target, &direction, None, &cwd).await?;
                     state.panes.insert(
                         rp.pane_id.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
+                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None, forwarded_tokens: None },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
                     spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&rp.pane_id), &deps.log)
@@ -1770,25 +1787,60 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     state.ratios.retain(|k, _| k.split('|').next().is_some_and(|t| live_tabs.contains(t)));
 
     // 5. push authoritative agent status onto mirror panes
-    push_statuses(deps, &remote_snap, state).await;
+    push_statuses(deps, &remote_snap, &local_snap, state).await;
     Ok(())
 }
 
+/// herdr rejects a metadata report that names more token keys than this —
+/// the whole report, title and status labels included.
+const MAX_TOKEN_KEYS_PER_REPORT: usize = 16;
+
+/// The token patch that takes a mirror from the keys it last forwarded to the
+/// remote's current set, and the keys to remember afterwards.
+///
+/// herdr's token map is a patch: omitted keys stay. A key the remote dropped
+/// is sent as `null`, or the mirror shows its last value forever. Clears are
+/// capped so the report stays within herdr's per-report key limit; the rest
+/// stay remembered and go out on a later pass.
+fn token_patch(
+    forwarded: &BTreeSet<String>,
+    remote: &HashMap<String, String>,
+) -> (serde_json::Map<String, Value>, BTreeSet<String>) {
+    let mut patch: serde_json::Map<String, Value> =
+        remote.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+    let mut keep: BTreeSet<String> = remote.keys().cloned().collect();
+    let room = MAX_TOKEN_KEYS_PER_REPORT.saturating_sub(remote.len());
+    for (i, gone) in forwarded.iter().filter(|k| !remote.contains_key(*k)).enumerate() {
+        if i < room {
+            patch.insert(gone.clone(), Value::Null);
+        } else {
+            keep.insert(gone.clone());
+        }
+    }
+    (patch, keep)
+}
+
 /// Push one pane's authoritative status (or retract it when the remote agent
-/// is gone). Mutates only its own entry (seq/reported). Reused by both the
-/// full converge and the daemon's status fast-path.
+/// is gone). Mutates only its own entry (seq/reported/forwarded_tokens).
+/// Reused by both the full converge and the daemon's status fast-path.
+///
+/// `tokens` is the remote pane's complete token map when the caller has one
+/// (a snapshot), and `None` when it does not: a status event carries no
+/// tokens, and herdr omits an empty map, so absence there is not "cleared".
 pub async fn push_pane_status(
     local: &ApiClient,
     host_name: &str,
     remote_id: &str,
     entry: &mut PaneEntry,
     agent: Option<&AgentInfo>,
+    tokens: Option<&HashMap<String, String>>,
     log: &Logger,
 ) {
     if entry.is_tombstoned() {
         return;
     }
     let source = mirror_source(host_name);
+    let tokens = tokens.map(|t| token_patch(entry.forwarded_tokens.as_ref().unwrap_or(&BTreeSet::new()), t));
     match agent {
         Some(agent) => {
             entry.seq += 1;
@@ -1830,17 +1882,33 @@ pub async fn push_pane_status(
                 "display_agent": display,
                 "title": agent.effective_title(),
                 "state_labels": agent.state_labels.clone().unwrap_or_default(),
-                "tokens": agent.tokens.clone(),
                 "seq": entry.seq,
             });
             if custom.is_none() {
                 meta["clear_custom_status"] = json!(true);
             }
-            let _ = local.request("pane.report_metadata", meta).await;
+            if let Some((patch, _)) = tokens.as_ref().filter(|(p, _)| !p.is_empty()) {
+                meta["tokens"] = json!(patch);
+            }
+            let sent = local.request("pane.report_metadata", meta).await;
             entry.reported = Some(label);
+            remember_tokens(entry, sent.is_ok(), tokens);
         }
         None => {
-            let Some(reported) = entry.reported.clone() else { return };
+            let Some(reported) = entry.reported.clone() else {
+                // no agent row of ours here, but tokens it showed may remain
+                if let Some((patch, _)) = tokens.as_ref().filter(|(p, _)| !p.is_empty()) {
+                    entry.seq += 1;
+                    let sent = local
+                        .request(
+                            "pane.report_metadata",
+                            json!({ "pane_id": entry.local_id, "source": source, "tokens": patch, "seq": entry.seq }),
+                        )
+                        .await;
+                    remember_tokens(entry, sent.is_ok(), tokens);
+                }
+                return;
+            };
             // remote agent exited — retract our claim so the mirror pane doesn't
             // show a phantom agent row forever
             entry.seq += 1;
@@ -1855,22 +1923,34 @@ pub async fn push_pane_status(
                 log.log(&format!("release_agent {}: {e}", entry.local_id));
             }
             entry.seq += 1;
-            let _ = local
-                .request(
-                    "pane.report_metadata",
-                    json!({
-                        "pane_id": entry.local_id,
-                        "source": source,
-                        "clear_display_agent": true,
-                        "clear_custom_status": true,
-                        "clear_state_labels": true,
-                        "clear_title": true,
-                        "seq": entry.seq,
-                    }),
-                )
-                .await;
+            let mut clear = json!({
+                "pane_id": entry.local_id,
+                "source": source,
+                "clear_display_agent": true,
+                "clear_custom_status": true,
+                "clear_state_labels": true,
+                "clear_title": true,
+                "seq": entry.seq,
+            });
+            if let Some((patch, _)) = tokens.as_ref().filter(|(p, _)| !p.is_empty()) {
+                clear["tokens"] = json!(patch);
+            }
+            let sent = local.request("pane.report_metadata", clear).await;
             entry.reported = None;
+            remember_tokens(entry, sent.is_ok(), tokens);
         }
+    }
+}
+
+/// Record what a token patch left on the mirror. A report that failed keeps
+/// the old set, so a clear it carried is retried on the next pass.
+fn remember_tokens(
+    entry: &mut PaneEntry,
+    sent: bool,
+    tokens: Option<(serde_json::Map<String, Value>, BTreeSet<String>)>,
+) {
+    if let (true, Some((_, keep))) = (sent, tokens) {
+        entry.forwarded_tokens = Some(keep);
     }
 }
 
@@ -1915,12 +1995,22 @@ pub async fn apply_remote_closes(
     }
 }
 
-pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &mut HostState) {
+pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, local_snap: &Snapshot, state: &mut HostState) {
     let agent_by_pane: HashMap<&str, &AgentInfo> =
         remote_snap.agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
+    let no_tokens = HashMap::new();
     for (remote_id, entry) in state.panes.iter_mut() {
         let agent = agent_by_pane.get(remote_id.as_str()).copied();
-        push_pane_status(&deps.local, &deps.host.name, remote_id, entry, agent, &deps.log).await;
+        // a map written before tokens were tracked: start from what the
+        // mirror pane shows now, so values forwarded back then can be cleared
+        if entry.forwarded_tokens.is_none() {
+            let local = local_snap.panes.iter().find(|p| p.pane_id == entry.local_id);
+            entry.forwarded_tokens = Some(local.map(|p| p.tokens.keys().cloned().collect()).unwrap_or_default());
+        }
+        // the snapshot is the whole truth: an agent it does not list has no
+        // tokens for the mirror to show
+        let tokens = agent.map_or(&no_tokens, |a| &a.tokens);
+        push_pane_status(&deps.local, &deps.host.name, remote_id, entry, agent, Some(tokens), &deps.log).await;
     }
 }
 
@@ -2128,6 +2218,7 @@ mod tests {
             root_tab_local_id: None,
             last_remote_label: None,
             last_local_label: None,
+            forwarded_tokens: None,
         }
     }
 
@@ -2224,7 +2315,7 @@ mod tests {
     }
 
     fn tombstoned(local_id: &str) -> PaneEntry {
-        PaneEntry { local_id: local_id.into(), tombstone: Some(true), seq: 0, reported: None }
+        PaneEntry { local_id: local_id.into(), tombstone: Some(true), seq: 0, reported: None, forwarded_tokens: None }
     }
 
     /// A locally-closed (tombstoned) pane must not survive into the tree a tab
@@ -2238,7 +2329,7 @@ mod tests {
         let mut panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
         panes.insert(
             "p1".into(),
-            PaneEntry { local_id: "l1".into(), tombstone: None, seq: 0, reported: None },
+            PaneEntry { local_id: "l1".into(), tombstone: None, seq: 0, reported: None, forwarded_tokens: None },
         );
         let mut ids = Vec::new();
         walk_pane_ids(&prune_closed(&tree, &panes).unwrap(), &mut ids);
@@ -2559,6 +2650,7 @@ mod tests {
             label: None,
             cwd: Some(cwd.into()),
             foreground_cwd: Some(cwd.into()),
+            tokens: HashMap::new(),
         }
     }
 
@@ -2802,6 +2894,7 @@ mod tests {
             label: None,
             cwd: Some(cwd.into()),
             foreground_cwd: None,
+            tokens: HashMap::new(),
         };
         let panes = vec![
             pane("w1", "/state/.mirror-pane"),
@@ -2872,6 +2965,7 @@ mod tests {
             label: None,
             cwd: None,
             foreground_cwd: None,
+            tokens: HashMap::new(),
         }
     }
 
@@ -2885,7 +2979,7 @@ mod tests {
         for (rid, local, tomb) in [("p1", "L1:p1", false), ("p2", "L2:p1", false), ("p3", "L2:p2", true)] {
             state.panes.insert(
                 rid.into(),
-                PaneEntry { local_id: local.into(), tombstone: tomb.then_some(true), seq: 0, reported: None },
+                PaneEntry { local_id: local.into(), tombstone: tomb.then_some(true), seq: 0, reported: None, forwarded_tokens: None },
             );
         }
         let local = vec![ws("L1", None, None, false), ws("L2", None, None, false)];
@@ -2924,5 +3018,166 @@ mod tests {
         assert_eq!(rank(&ws("V", Some("/g/vm/wt/vm+w1"), Some("/g/vm/main"), true)), 3);
         assert_eq!(rank(&ws("L", None, None, false)), 0, "a local workspace");
         assert_eq!(rank(&ws("O", Some("/src/app"), Some("/src/app"), false)), 0, "a local repo");
+    }
+
+
+    fn keys(ks: &[&str]) -> BTreeSet<String> {
+        ks.iter().map(|k| k.to_string()).collect()
+    }
+
+    fn token_map(kv: &[(&str, &str)]) -> HashMap<String, String> {
+        kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// herdr's token map is a patch, so a key the remote dropped goes out as
+    /// null; one it still has goes out with its value.
+    #[test]
+    fn a_token_the_remote_dropped_is_cleared_not_left_behind() {
+        let (patch, keep) =
+            token_patch(&keys(&["agent_hot", "pr_failing", "model"]), &token_map(&[("model", "opus")]));
+        assert_eq!(
+            Value::Object(patch),
+            json!({ "model": "opus", "agent_hot": null, "pr_failing": null })
+        );
+        assert_eq!(keep, keys(&["model"]));
+
+        // the remote cleared its last token: clear it here too
+        let (patch, keep) = token_patch(&keys(&["skill"]), &HashMap::new());
+        assert_eq!(Value::Object(patch), json!({ "skill": null }));
+        assert!(keep.is_empty());
+
+        // nothing forwarded and nothing to forward: no report at all
+        let (patch, keep) = token_patch(&BTreeSet::new(), &HashMap::new());
+        assert!(patch.is_empty() && keep.is_empty());
+    }
+
+    /// A report naming more than 16 token keys is rejected whole, title and
+    /// all, so clears only fill the room the set keys leave; the rest stay
+    /// remembered for the next pass.
+    #[test]
+    fn token_clears_never_push_a_report_past_herdrs_key_limit() {
+        let remote: HashMap<String, String> = (0..14).map(|i| (format!("k{i:02}"), "v".into())).collect();
+        let forwarded = keys(&["gone_a", "gone_b", "gone_c"]);
+        let (patch, keep) = token_patch(&forwarded, &remote);
+        assert_eq!(patch.len(), MAX_TOKEN_KEYS_PER_REPORT);
+        assert_eq!(patch.get("gone_a"), Some(&Value::Null));
+        assert_eq!(patch.get("gone_b"), Some(&Value::Null));
+        assert!(!patch.contains_key("gone_c"));
+        assert!(keep.contains("gone_c"), "the clear that did not fit is retried later");
+        assert_eq!(keep.len(), 15);
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+    /// A stand-in herdr socket: answers every request with an empty result
+    /// and records (method, params).
+    async fn fake_herdr(name: &str) -> (ApiClient, Seen, Logger, PathBuf) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("hm-tokens-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let seen: Seen = Default::default();
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (read, mut write) = stream.into_split();
+                let Ok(Some(line)) = BufReader::new(read).lines().next_line().await else { continue };
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let method = req["method"].as_str().unwrap().to_string();
+                if method != "ping" {
+                    record.lock().unwrap().push((method, req["params"].clone()));
+                }
+                let reply = json!({ "id": req["id"], "result": {} }).to_string() + "\n";
+                let _ = write.write_all(reply.as_bytes()).await;
+            }
+        });
+        let api = ApiClient::connect(&sock).await.unwrap();
+        (api, seen, Logger::new(&dir, false), dir)
+    }
+
+    fn metadata_reports(seen: &Seen) -> Vec<Value> {
+        let seen = seen.lock().unwrap();
+        seen.iter().filter(|(m, _)| m == "pane.report_metadata").map(|(_, p)| p.clone()).collect()
+    }
+
+    fn tracked_entry(forwarded: &[&str], reported: Option<&str>) -> PaneEntry {
+        PaneEntry {
+            local_id: "w9:p1".into(),
+            tombstone: None,
+            seq: 0,
+            reported: reported.map(Into::into),
+            forwarded_tokens: Some(keys(forwarded)),
+        }
+    }
+
+    /// A snapshot pass clears what the remote cleared, on the same report as
+    /// the rest of the row, and remembers only what is left.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_snapshot_push_clears_tokens_the_remote_cleared() {
+        let (api, seen, log, dir) = fake_herdr("snap").await;
+        let mut entry = tracked_entry(&["agent_hot", "pr_failing", "model"], Some("claude"));
+        let agent = AgentInfo {
+            agent: Some("claude".into()),
+            agent_status: Some("working".into()),
+            tokens: token_map(&[("model", "opus 4.8")]),
+            ..Default::default()
+        };
+        push_pane_status(&api, "vm", "w1:p1", &mut entry, Some(&agent), Some(&agent.tokens), &log).await;
+        let reports = metadata_reports(&seen);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0]["tokens"], json!({ "model": "opus 4.8", "agent_hot": null, "pr_failing": null }));
+        assert_eq!(reports[0]["source"], json!(mirror_source("vm")));
+        assert_eq!(entry.forwarded_tokens, Some(keys(&["model"])));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A status event carries no tokens. Reading that as "all cleared" would
+    /// wipe every mirrored token on each status change.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_status_event_leaves_tokens_alone() {
+        let (api, seen, log, dir) = fake_herdr("event").await;
+        let mut entry = tracked_entry(&["agent_hot", "model"], Some("claude"));
+        let agent = AgentInfo {
+            agent: Some("claude".into()),
+            agent_status: Some("idle".into()),
+            ..Default::default()
+        };
+        push_pane_status(&api, "vm", "w1:p1", &mut entry, Some(&agent), None, &log).await;
+        let reports = metadata_reports(&seen);
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].get("tokens").is_none(), "{}", reports[0]);
+        assert_eq!(entry.forwarded_tokens, Some(keys(&["agent_hot", "model"])));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No agent row on the remote: the tokens the mirror forwarded are cleared
+    /// with the release, and also later when there was nothing to release.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_agent_gone_from_the_snapshot_takes_its_tokens_with_it() {
+        let (api, seen, log, dir) = fake_herdr("gone").await;
+        let none = HashMap::new();
+
+        let mut entry = tracked_entry(&["agent_hot"], Some("claude"));
+        push_pane_status(&api, "vm", "w1:p1", &mut entry, None, Some(&none), &log).await;
+        let reports = metadata_reports(&seen);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0]["clear_title"], json!(true));
+        assert_eq!(reports[0]["tokens"], json!({ "agent_hot": null }));
+        assert_eq!(entry.forwarded_tokens, Some(BTreeSet::new()));
+
+        // released on an earlier pass, but a token outlived it
+        let mut entry = tracked_entry(&["pr_failing"], None);
+        push_pane_status(&api, "vm", "w1:p1", &mut entry, None, Some(&none), &log).await;
+        let reports = metadata_reports(&seen);
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[1]["tokens"], json!({ "pr_failing": null }));
+        assert_eq!(entry.forwarded_tokens, Some(BTreeSet::new()));
+
+        // and nothing to say once both sides are empty
+        push_pane_status(&api, "vm", "w1:p1", &mut entry, None, Some(&none), &log).await;
+        assert_eq!(metadata_reports(&seen).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

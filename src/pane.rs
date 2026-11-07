@@ -212,6 +212,9 @@ enum Msg {
 struct Session {
     gen: u64,
     mode: Mode,
+    /// the rect the session asked the server for: an observe stream is clipped
+    /// to it and cannot be resized, only replaced
+    size: (usize, usize),
     process_group: i32,
     stdin: ChildStdin,
 }
@@ -390,7 +393,7 @@ fn spawn_session(
         let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
     });
 
-    Ok(Session { gen, mode, process_group, stdin })
+    Ok(Session { gen, mode, size: (cols, rows), process_group, stdin })
 }
 
 // ---------------------------------------------------------------------------
@@ -912,6 +915,9 @@ struct App {
     paste_original: Option<Vec<u8>>,
 }
 
+/// how long a resize must settle before an observe stream is respawned at the new size
+const OBSERVE_RESIZE_SETTLE: Duration = Duration::from_millis(250);
+
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
 /// poll lazily (only around mouse activity) and no faster than this
 const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
@@ -1191,6 +1197,18 @@ impl App {
                 self.takeover_armed = true;
             }
             self.reconnect_at = Some((Instant::now(), m));
+        }
+    }
+
+    /// The pane is now `size` while observing. The server renders an
+    /// observer's rect from the top and clips the rest, and observe takes no
+    /// resize, so a stream asked for at another size is re-asked at this one —
+    /// otherwise a pane that grew while another client holds control keeps
+    /// showing only the top of the remote. Deferred, so a window drag respawns
+    /// the stream once.
+    fn reask_observe_at(&mut self, size: (usize, usize)) {
+        if self.switching_to.is_none() && self.session.as_ref().is_some_and(|s| s.size != size) {
+            self.reconnect_at = Some((Instant::now() + OBSERVE_RESIZE_SETTLE, Mode::Observe));
         }
     }
 
@@ -1889,6 +1907,9 @@ pub async fn run(args: Args) -> Result<()> {
                     // not push a capped host past its ceiling either
                     let (cols, rows) = app.control_size();
                     app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
+                } else {
+                    let size = app.observe_size();
+                    app.reask_observe_at(size);
                 }
                 app.paint();
             }
@@ -2599,7 +2620,7 @@ mod tests {
             .stdin(Stdio::piped()).stdout(stdout).kill_on_drop(true)
             .spawn().unwrap();
         app.session = Some(Session {
-            gen: 1, mode: Mode::Control, process_group: child.id().unwrap() as i32,
+            gen: 1, mode: Mode::Control, size: (80, 24), process_group: child.id().unwrap() as i32,
             stdin: child.stdin.take().unwrap(),
         });
         app.mode = Mode::Control;
@@ -2703,6 +2724,43 @@ mod tests {
         app.handle_stdin(b"x".to_vec()).await;
         assert!(app.takeover_armed);
         assert!(app.reconnect_at.is_some_and(|(t, _)| t <= Instant::now()));
+        drop(app);
+        child.kill().await.unwrap();
+    }
+
+    /// A watching pane that is resized re-asks for its stream at the new size
+    /// once the drag settles; one already at that size, or mid-switch, does not.
+    #[tokio::test]
+    async fn a_resized_watching_pane_respawns_its_stream_at_the_new_size() {
+        let (mut app, mut child) = control_app(Stdio::null());
+        app.mode = Mode::Observe;
+        app.session.as_mut().unwrap().mode = Mode::Observe;
+
+        app.reask_observe_at((80, 24));
+        assert!(app.reconnect_at.is_none(), "same size: the stream already fits");
+
+        let before = Instant::now();
+        app.reask_observe_at((200, 60));
+        let (at, m) = app.reconnect_at.expect("grown: re-ask");
+        assert_eq!(m, Mode::Observe);
+        assert!(at >= before + OBSERVE_RESIZE_SETTLE, "deferred so a drag respawns once");
+
+        // a later drag event pushes the settle out rather than stacking
+        app.reask_observe_at((210, 62));
+        assert!(app.reconnect_at.is_some_and(|(t, _)| t >= at));
+
+        // a mode switch already reconnects at the current size
+        app.reconnect_at = None;
+        app.switching_to = Some(Mode::Control);
+        app.reask_observe_at((200, 60));
+        assert!(app.reconnect_at.is_none());
+
+        // nothing to replace while no stream is up
+        app.switching_to = None;
+        app.session = None;
+        app.reask_observe_at((200, 60));
+        assert!(app.reconnect_at.is_none());
+
         drop(app);
         child.kill().await.unwrap();
     }
