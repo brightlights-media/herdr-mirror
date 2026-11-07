@@ -6,7 +6,7 @@
 // The camelCase JSON shape matches the TS implementation so an existing
 // <host>-map.json carries over.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,12 @@ pub struct PaneEntry {
     /// when the remote agent goes away, or it sticks forever
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reported: Option<String>,
+    /// token keys last forwarded onto this pane. herdr's token map is a patch,
+    /// so a key the remote drops has to be cleared explicitly. `None` means
+    /// not tracked yet (a map written before this field): the first pass
+    /// takes the mirror pane's current keys instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_tokens: Option<BTreeSet<String>>,
 }
 
 impl PaneEntry {
@@ -53,6 +59,9 @@ pub struct WsEntry {
     /// `label` style) restamps instead of pushing the old form to the remote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_local_label: Option<String>,
+    /// token keys last forwarded onto this workspace, as on `PaneEntry`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_tokens: Option<BTreeSet<String>>,
 }
 
 impl WsEntry {
@@ -336,6 +345,30 @@ mod tests {
         assert!(!out.contains("\"reported\":null"));
     }
 
+    /// A map written before token tracking loads as "not tracked yet", which
+    /// the first pass fills from the mirror; once tracked, an empty set stays
+    /// distinct from that.
+    #[test]
+    fn forwarded_tokens_tell_untracked_from_none_forwarded() {
+        let old = r#"{ "panes": { "w9:p1": { "localId": "w1:p1", "seq": 3 } },
+                       "workspaces": { "w9": { "localId": "w1" } } }"#;
+        let mut state: HostState = serde_json::from_str(old).unwrap();
+        assert_eq!(state.panes["w9:p1"].forwarded_tokens, None);
+        assert_eq!(state.workspaces["w9"].forwarded_tokens, None);
+
+        state.panes.get_mut("w9:p1").unwrap().forwarded_tokens = Some(BTreeSet::new());
+        state.workspaces.get_mut("w9").unwrap().forwarded_tokens =
+            Some(["jj_status".to_string()].into_iter().collect());
+        let out = serde_json::to_string(&state).unwrap();
+        assert!(out.contains("\"forwardedTokens\":[]"), "{out}");
+        let reparsed: HostState = serde_json::from_str(&out).unwrap();
+        assert_eq!(reparsed.panes["w9:p1"].forwarded_tokens, Some(BTreeSet::new()));
+        assert_eq!(
+            reparsed.workspaces["w9"].forwarded_tokens,
+            Some(["jj_status".to_string()].into_iter().collect())
+        );
+    }
+
     #[test]
     fn mapped_local_workspaces_spans_every_hosts_map() {
         let dir = std::env::temp_dir().join(format!("hm-mapped-{}", std::process::id()));
@@ -345,6 +378,7 @@ mod tests {
             root_tab_local_id: None,
             last_remote_label: None,
             last_local_label: Some("🟩 vm-3".into()),
+            forwarded_tokens: None,
         };
         let mut a = HostState::default();
         a.workspaces.insert("w1".into(), entry("w5"));
@@ -422,6 +456,7 @@ mod tests {
             root_tab_local_id: None,
             last_remote_label: None,
             last_local_label: None,
+            forwarded_tokens: None,
         };
         let with = |entries: Vec<(&str, WsEntry)>| HostState {
             workspaces: entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
@@ -448,7 +483,7 @@ mod tests {
         for (rid, lid) in mapped {
             state.panes.insert(
                 rid.to_string(),
-                PaneEntry { local_id: lid.to_string(), tombstone: None, seq: 0, reported: None },
+                PaneEntry { local_id: lid.to_string(), tombstone: None, seq: 0, reported: None, forwarded_tokens: None },
             );
         }
         state
