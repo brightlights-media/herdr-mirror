@@ -813,6 +813,22 @@ fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
 }
 
+/// `bytes` with every complete SGR mouse report removed.
+fn without_mouse(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match parse_mouse(bytes, i) {
+            Some((.., len)) => i += len,
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 
 // ---------------------------------------------------------------------------
 // the wrapper state machine
@@ -922,6 +938,10 @@ struct App {
     last_select_rows: Option<(usize, usize)>,
     /// last time a foreground poll was kicked off (throttles the ssh handshakes)
     fg_poll_at: Option<Instant>,
+    /// when `remote_fg` was last confirmed by a poll
+    fg_seen_at: Option<Instant>,
+    /// raw mouse reports waiting for a fresh classification (see `send_raw_mouse`)
+    held_mouse: Vec<u8>,
     /// scheduled delayed re-poll to catch a foreground change the last input just
     /// caused (e.g. quitting a TUI back to a shell); bypasses the throttle
     settle_at: Option<Instant>,
@@ -954,6 +974,11 @@ const OBSERVE_RESIZE_SETTLE: Duration = Duration::from_millis(250);
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
 /// poll lazily (only around mouse activity) and no faster than this
 const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+/// How old a classification may be and still decide where a raw mouse report
+/// goes. Input refreshes it, but a program can exit on its own (a test run
+/// ending at its shell prompt): routing a click on that stale answer replays
+/// it into the prompt as `0;101;28M`.
+const FG_FRESH: Duration = Duration::from_millis(1000);
 
 /// after input settles, re-poll once this much later to catch a foreground
 /// change the input caused (e.g. a TUI just exited); bypasses FG_POLL_INTERVAL
@@ -1421,6 +1446,42 @@ impl App {
         self.arm_input_flush();
     }
 
+    /// Forward raw mouse reports only to a foreground known, recently, not to
+    /// be a shell: a prompt never enabled mouse reporting and prints them. A
+    /// stale classification holds them for a forced poll (`on_foreground`).
+    async fn send_raw_mouse(&mut self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.fg_seen_at.is_some_and(|t| t.elapsed() < FG_FRESH) {
+            if matches!(self.remote_fg, Some(Fg::Agent) | Some(Fg::Mouse)) {
+                self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) })).await;
+            }
+            return;
+        }
+        self.held_mouse.extend_from_slice(&bytes);
+        self.spawn_foreground_poll(true);
+    }
+
+    /// A foreground poll answered. `None` (the poll failed) keeps the last
+    /// classification but confirms nothing, so held mouse reports are dropped.
+    async fn on_foreground(&mut self, v: Option<Fg>) {
+        let held = std::mem::take(&mut self.held_mouse);
+        if v.is_none() {
+            return;
+        }
+        self.fg_seen_at = Some(Instant::now());
+        // a foreground change means the screen belongs to a different program
+        // now, so the old highlight points at text that is gone
+        if v != self.remote_fg && self.select.clear() {
+            self.paint();
+        }
+        self.remote_fg = v;
+        self.sync_mouse_grab();
+        self.sync_cursor_key_mode();
+        self.send_raw_mouse(held).await;
+    }
+
     /// Ordinary input, held back while an upload is in flight so the pasted
     /// remote paths cannot be overtaken by whatever was typed after them.
     async fn route_input(&mut self, bytes: Vec<u8>) {
@@ -1556,8 +1617,14 @@ impl App {
         }
         if self.switching_to == Some(Mode::Control) || self.session.is_none() {
             // spinning up or awaiting reconnect: queue the keystroke (flushed
-            // on connect) and, if in backoff, reconnect now
-            self.pending_input.push(buf);
+            // on connect) and, if in backoff, reconnect now. Mouse reports are
+            // not queued: the flush writes raw bytes, skipping the routing that
+            // keeps them out of a shell, and a click on a screen that is not
+            // live has no target anyway.
+            let keys = without_mouse(&buf);
+            if !keys.is_empty() {
+                self.pending_input.push(keys);
+            }
             self.retry_now_for_input();
             return;
         }
@@ -1573,6 +1640,7 @@ impl App {
         // left-button drags go to the plugin selector; other TUI clicks/drags
         // forward to the remote pty. a shell never sees raw SGR.
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
+        let mut raw_mouse: Vec<u8> = Vec::new();
         let mut i = 0usize;
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
         let mut sel_changed = false;
@@ -1586,7 +1654,7 @@ impl App {
                     // and would write OSC 52 into something that is not a
                     // terminal. Forward instead, which is what `main` did.
                     MouseAction::Select if !self.tty => {
-                        rest.extend_from_slice(&buf[i..i + len]);
+                        raw_mouse.extend_from_slice(&buf[i..i + len]);
                     }
                     MouseAction::Select => {
                         let at = Select::locate(&self.grid, term_size().1, x, y);
@@ -1610,11 +1678,7 @@ impl App {
                                 // A shell does not: the prompt never enabled
                                 // mouse reporting, and the bytes would dump
                                 // into it.
-                                Released::Click(bytes) => {
-                                    if self.remote_fg != Some(Fg::Shell) {
-                                        rest.extend_from_slice(&bytes);
-                                    }
-                                }
+                                Released::Click(bytes) => raw_mouse.extend_from_slice(&bytes),
                                 Released::Nothing => {}
                             },
                         }
@@ -1635,7 +1699,7 @@ impl App {
                             "modifiers": 0,
                         }));
                     }
-                    MouseAction::ForwardRaw => rest.extend_from_slice(&buf[i..i + len]),
+                    MouseAction::ForwardRaw => raw_mouse.extend_from_slice(&buf[i..i + len]),
                     MouseAction::Drop => {}
                 }
                 i += len;
@@ -1647,6 +1711,7 @@ impl App {
         for s in scrolls {
             self.send(s).await;
         }
+        self.send_raw_mouse(raw_mouse).await;
         if let Some((start, end)) = copy_span {
             let text = self.grid.selection_text(start, end);
             match crate::select::osc52(&text) {
@@ -1844,6 +1909,8 @@ pub async fn run(args: Args) -> Result<()> {
         select: Select::new(),
         last_select_rows: None,
         fg_poll_at: None,
+        fg_seen_at: None,
+        held_mouse: Vec::new(),
         settle_at: None,
         mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
         // startup leaves the pane in normal cursor mode; the first classification
@@ -1911,18 +1978,7 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
-                    // keep the last good classification if a poll failed (None)
-                    Some(Msg::Foreground(v)) => if v.is_some() {
-                        // a foreground change means the screen belongs to a
-                        // different program now, so the old highlight points at
-                        // text that is gone
-                        if v != app.remote_fg && app.select.clear() {
-                            app.paint();
-                        }
-                        app.remote_fg = v;
-                        app.sync_mouse_grab();
-                        app.sync_cursor_key_mode();
-                    },
+                    Some(Msg::Foreground(v)) => app.on_foreground(v).await,
                     Some(Msg::Paste(outcome)) => app.handle_paste(outcome).await,
                     Some(Msg::Drop(result)) => app.handle_drop(result).await,
                 }
@@ -2647,6 +2703,8 @@ mod tests {
             select: Select::new(),
             last_select_rows: None,
             fg_poll_at: None,
+            fg_seen_at: None,
+            held_mouse: Vec::new(),
             settle_at: None,
             mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
             // startup leaves the pane in normal cursor mode; the first classification
@@ -2927,5 +2985,66 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(sent, b"ok".to_vec());
+    }
+
+    fn sent_bytes(stdout: Vec<u8>) -> Vec<Vec<u8>> {
+        String::from_utf8(stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                B64.decode(v["bytes"].as_str()?).ok()
+            })
+            .collect()
+    }
+
+    const CLICK: &[u8] = b"\x1b[<0;101;28M\x1b[<0;101;28m";
+
+    /// A TUI that exited on its own leaves a stale "wants the mouse" behind.
+    /// A click then waits for a fresh answer, and a shell prompt never gets it.
+    #[tokio::test]
+    async fn a_click_on_a_stale_classification_waits_for_a_fresh_one() {
+        let (mut app, child) = control_app(Stdio::piped());
+        app.remote_fg = Some(Fg::Mouse); // `make` was running; it has since exited
+        app.handle_stdin(CLICK.to_vec()).await;
+        assert_eq!(app.held_mouse, CLICK, "held, not sent on a stale classification");
+        app.on_foreground(Some(Fg::Shell)).await;
+        assert!(app.held_mouse.is_empty());
+
+        // a real TUI: the held click goes out once the poll confirms it
+        app.fg_seen_at = None;
+        app.remote_fg = Some(Fg::Shell);
+        app.handle_stdin(CLICK.to_vec()).await;
+        app.on_foreground(Some(Fg::Mouse)).await;
+        // and a fresh classification routes the next click at once
+        app.handle_stdin(CLICK.to_vec()).await;
+        // a failed poll confirms nothing: what it held is dropped
+        app.fg_seen_at = None;
+        app.handle_stdin(CLICK.to_vec()).await;
+        app.on_foreground(None).await;
+        assert!(app.held_mouse.is_empty());
+
+        drop(app); // closes cat's stdin
+        let out = child.wait_with_output().await.unwrap();
+        assert_eq!(sent_bytes(out.stdout), vec![CLICK.to_vec(), CLICK.to_vec()]);
+    }
+
+    /// Input queued while control is reconnecting is flushed raw on connect,
+    /// so a click in it must not be queued.
+    #[tokio::test]
+    async fn a_click_while_reconnecting_is_not_queued() {
+        let (mut app, _child) = control_app(Stdio::piped());
+        app.session = None;
+        app.remote_fg = Some(Fg::Mouse);
+        app.handle_stdin([CLICK, b"x"].concat()).await;
+        assert_eq!(app.pending_input, vec![b"x".to_vec()]);
+        app.handle_stdin(CLICK.to_vec()).await;
+        assert_eq!(app.pending_input, vec![b"x".to_vec()]);
+    }
+
+    #[test]
+    fn without_mouse_keeps_everything_but_complete_reports() {
+        assert_eq!(without_mouse(b"a\x1b[<0;1;1Mb\x1b[<64;2;2Mc"), b"abc".to_vec());
+        assert_eq!(without_mouse(b"\x1b[A\x1b[<0;1"), b"\x1b[A\x1b[<0;1".to_vec());
     }
 }
