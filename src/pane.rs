@@ -599,11 +599,42 @@ pub(crate) fn split_mouse(buf: &mut Vec<u8>, chunk: Vec<u8>) -> MouseSplit {
     }
 }
 
-/// A timed-out lone ESC is still a key; an incomplete mouse prefix is dropped
-/// so it cannot leak as literal input into a remote shell.
-fn flush_mouse(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let pending = std::mem::take(buf);
-    (pending == b"\x1b").then_some(pending)
+#[derive(Debug, PartialEq)]
+enum Flushed {
+    /// a lone ESC: still a key, so it goes out
+    Key(Vec<u8>),
+    /// an incomplete mouse prefix, kept back so it cannot leak as literal
+    /// input into a remote shell (see `rejoin_mouse_tail`)
+    Dropped(Vec<u8>),
+}
+
+/// What to do with held mouse input once its window has run out.
+fn flush_mouse(held: Vec<u8>) -> Flushed {
+    if held == b"\x1b" {
+        Flushed::Key(held)
+    } else {
+        Flushed::Dropped(held)
+    }
+}
+
+/// Rejoin a dropped mouse prefix to the next read when that read starts with
+/// its rest, so the report is routed whole instead of its rest going out as
+/// typed text (`0;101;28M` in an agent's prompt). The window can run out with
+/// the rest already read: it waits in the channel behind a burst of remote
+/// frames, and the loop's unbiased `select!` can take the expired timer first.
+/// Anything that does not complete the report is ordinary input.
+fn rejoin_mouse_tail(dropped: Vec<u8>, chunk: Vec<u8>) -> Vec<u8> {
+    if dropped.is_empty() {
+        return chunk;
+    }
+    let n = dropped.len();
+    let mut all = dropped;
+    all.extend_from_slice(&chunk);
+    if parse_mouse(&all, 0).is_some() {
+        all
+    } else {
+        all.split_off(n)
+    }
 }
 
 /// How a parsed mouse event should be routed while in control mode.
@@ -907,6 +938,8 @@ struct App {
     paste_buf: Vec<u8>,
     /// partially-received SGR mouse sequence
     mouse_buf: Vec<u8>,
+    /// a mouse prefix whose window ran out, rejoined if the next read completes it
+    mouse_dropped: Vec<u8>,
     input_flush_at: Option<Instant>,
     /// input held back while an upload is in flight, flushed in order after
     paste_queue: Vec<Queued>,
@@ -1350,8 +1383,9 @@ impl App {
                 self.route_input(bytes).await;
             }
         }
-        if let Some(bytes) = flush_mouse(&mut self.mouse_buf) {
-            self.route_input(bytes).await;
+        match flush_mouse(std::mem::take(&mut self.mouse_buf)) {
+            Flushed::Key(bytes) => self.route_input(bytes).await,
+            Flushed::Dropped(prefix) => self.mouse_dropped = prefix,
         }
     }
 
@@ -1363,7 +1397,7 @@ impl App {
     /// first would silently swallow the second, and leave its markers in the
     /// tail to be forwarded raw at the remote.
     async fn handle_stdin(&mut self, chunk: Vec<u8>) {
-        let mut chunk = chunk;
+        let mut chunk = rejoin_mouse_tail(std::mem::take(&mut self.mouse_dropped), chunk);
         loop {
             match split_paste(&mut self.paste_buf, chunk) {
                 PasteSplit::Pending => break,
@@ -1818,6 +1852,7 @@ pub async fn run(args: Args) -> Result<()> {
         paste_inflight: false,
         paste_buf: Vec::new(),
         mouse_buf: Vec::new(),
+        mouse_dropped: Vec::new(),
         input_flush_at: None,
         paste_queue: Vec::new(),
         paste_original: None,
@@ -2272,13 +2307,21 @@ mod tests {
 
     #[test]
     fn timed_out_mouse_prefix_is_dropped_but_escape_survives() {
-        let mut mouse = b"\x1b[<0;3;2".to_vec();
-        assert_eq!(flush_mouse(&mut mouse), None);
-        assert!(mouse.is_empty());
+        assert_eq!(flush_mouse(b"\x1b[<0;3;2".to_vec()), Flushed::Dropped(b"\x1b[<0;3;2".to_vec()));
+        assert_eq!(flush_mouse(b"\x1b".to_vec()), Flushed::Key(b"\x1b".to_vec()));
+    }
 
-        let mut escape = b"\x1b".to_vec();
-        assert_eq!(flush_mouse(&mut escape), Some(b"\x1b".to_vec()));
-        assert!(escape.is_empty());
+    #[test]
+    fn a_dropped_mouse_prefix_rejoins_only_its_own_rest() {
+        assert_eq!(
+            rejoin_mouse_tail(b"\x1b[<".to_vec(), b"0;101;28Mx".to_vec()),
+            b"\x1b[<0;101;28Mx".to_vec()
+        );
+        assert_eq!(rejoin_mouse_tail(b"\x1b[".to_vec(), b"<0;3;2m".to_vec()), b"\x1b[<0;3;2m".to_vec());
+        // not its rest: ordinary input, and the prefix stays dropped
+        assert_eq!(rejoin_mouse_tail(b"\x1b[<".to_vec(), b"hello".to_vec()), b"hello".to_vec());
+        assert_eq!(rejoin_mouse_tail(b"\x1b[".to_vec(), b"A".to_vec()), b"A".to_vec());
+        assert_eq!(rejoin_mouse_tail(Vec::new(), b"0;1;1M".to_vec()), b"0;1;1M".to_vec());
     }
 
 
@@ -2612,6 +2655,7 @@ mod tests {
             paste_inflight: false,
             paste_buf: Vec::new(),
             mouse_buf: Vec::new(),
+            mouse_dropped: Vec::new(),
             input_flush_at: None,
             paste_queue: Vec::new(),
             paste_original: None,
@@ -2860,4 +2904,28 @@ mod tests {
         );
     }
 
+
+    /// A click split after its `ESC [ <` whose window runs out before the rest
+    /// is read must not type the rest into the remote pane.
+    #[tokio::test]
+    async fn a_click_whose_window_expired_does_not_leak_its_rest() {
+        let (mut app, child) = control_app(Stdio::piped());
+        app.remote_fg = Some(Fg::Shell);
+        app.handle_stdin(b"\x1b[<".to_vec()).await;
+        app.flush_held_input().await; // the window ran out first
+        app.handle_stdin(b"0;101;28M\x1b[<0;101;28m".to_vec()).await;
+        app.handle_stdin(b"ok".to_vec()).await;
+        drop(app); // closes cat's stdin
+        let out = child.wait_with_output().await.unwrap();
+        let sent: Vec<u8> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                B64.decode(v["bytes"].as_str()?).ok()
+            })
+            .flatten()
+            .collect();
+        assert_eq!(sent, b"ok".to_vec());
+    }
 }
